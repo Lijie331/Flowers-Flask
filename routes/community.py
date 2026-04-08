@@ -1,0 +1,1917 @@
+"""
+社区路由模块 - 收藏、花园、养护提醒、花友圈
+"""
+
+import os
+import json
+import uuid
+from flask import Blueprint, request, jsonify, current_app
+import pymysql
+from pymysql.cursors import DictCursor
+
+from config import DB_CONFIG
+from routes.auth import token_required
+
+bp = Blueprint('community', __name__, url_prefix='/api/community')
+
+# 导入经验值函数
+from routes.user import add_experience
+
+# 图片上传目录
+GARDEN_PHOTOS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'static', 'garden_photos')
+
+# 帖子图片和视频上传目录
+POST_IMAGES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'static', 'post_images')
+POST_VIDEOS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'static', 'post_videos')
+
+# 确保目录存在
+os.makedirs(GARDEN_PHOTOS_DIR, exist_ok=True)
+os.makedirs(POST_IMAGES_DIR, exist_ok=True)
+os.makedirs(POST_VIDEOS_DIR, exist_ok=True)
+
+
+# ============== 数据库辅助函数 ==============
+
+def get_db_connection():
+    """获取数据库连接"""
+    return pymysql.connect(**DB_CONFIG)
+
+
+def create_notification(user_id, actor_id, actor_name, actor_avatar, notification_type, target_type=None, target_id=None, target_content=None):
+    """创建用户通知"""
+    # 不给自己发通知
+    if str(user_id) == str(actor_id):
+        return
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO user_notifications 
+            (user_id, actor_id, actor_name, actor_avatar, notification_type, target_type, target_id, target_content)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (user_id, actor_id, actor_name, actor_avatar, notification_type, target_type, target_id, target_content))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============== 文件上传 API ==============
+
+@bp.route('/upload/image', methods=['POST'])
+@token_required
+def upload_post_image():
+    """上传帖子图片"""
+    from flask import g
+    if 'image' not in request.files:
+        return jsonify({'success': False, 'error': '没有上传文件'}), 400
+    
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({'success': False, 'error': '没有选择文件'}), 400
+    
+    # 获取文件扩展名
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+        return jsonify({'success': False, 'error': '不支持的图片格式'}), 400
+    
+    # 生成唯一文件名
+    filename = f"{uuid.uuid4().hex}{ext}"
+    filepath = os.path.join(POST_IMAGES_DIR, filename)
+    
+    try:
+        file.save(filepath)
+        url = f"/static/post_images/{filename}"
+        return jsonify({'success': True, 'url': url, 'filename': filename})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/upload/video', methods=['POST'])
+@token_required
+def upload_post_video():
+    """上传帖子视频"""
+    from flask import g
+    if 'video' not in request.files:
+        return jsonify({'success': False, 'error': '没有上传文件'}), 400
+    
+    file = request.files['video']
+    if file.filename == '':
+        return jsonify({'success': False, 'error': '没有选择文件'}), 400
+    
+    # 获取文件扩展名
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ['.mp4', '.avi', '.mov', '.wmv', '.flv']:
+        return jsonify({'success': False, 'error': '不支持的视频格式'}), 400
+    
+    # 检查文件大小 (限制100MB)
+    file.seek(0, 2)
+    size = file.tell()
+    file.seek(0)
+    if size > 100 * 1024 * 1024:
+        return jsonify({'success': False, 'error': '视频文件不能超过100MB'}), 400
+    
+    # 生成唯一文件名
+    filename = f"{uuid.uuid4().hex}{ext}"
+    filepath = os.path.join(POST_VIDEOS_DIR, filename)
+    
+    try:
+        file.save(filepath)
+        url = f"/static/post_videos/{filename}"
+        return jsonify({'success': True, 'url': url, 'filename': filename})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============== 收藏功能 API ==============
+
+@bp.route('/favorites', methods=['GET'])
+@token_required
+def get_favorites():
+    """获取用户收藏列表"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        cursor.execute("""
+            SELECT id, flower_id, folder_name, latin_name, chinese_name, created_at
+            FROM user_favorites
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        """, (user_id,))
+        
+        favorites = cursor.fetchall()
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'favorites': favorites,
+                'total': len(favorites)
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/favorites', methods=['POST'])
+@token_required
+def add_favorite():
+    """添加收藏"""
+    from flask import g
+    user_id = g.user_id
+    data = request.get_json()
+    
+    flower_id = data.get('flower_id')
+    folder_name = data.get('folder_name')
+    latin_name = data.get('latin_name', '')
+    chinese_name = data.get('chinese_name', '')
+    
+    if not folder_name:
+        return jsonify({'success': False, 'error': '缺少花卉名称'}), 400
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # 检查是否已收藏
+        cursor.execute("""
+            SELECT id FROM user_favorites WHERE user_id = %s AND folder_name = %s
+        """, (user_id, folder_name))
+        if cursor.fetchone():
+            return jsonify({'success': False, 'error': '已收藏过该花卉'}), 400
+        
+        cursor.execute("""
+            INSERT INTO user_favorites (user_id, flower_id, folder_name, latin_name, chinese_name)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (user_id, flower_id, folder_name, latin_name, chinese_name))
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '收藏成功'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/favorites/<int:favorite_id>', methods=['DELETE'])
+@token_required
+def remove_favorite(favorite_id):
+    """取消收藏"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            DELETE FROM user_favorites WHERE id = %s AND user_id = %s
+        """, (favorite_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({'success': False, 'error': '收藏不存在'}), 404
+        
+        return jsonify({'success': True, 'message': '已取消收藏'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/favorites/check', methods=['GET'])
+@token_required
+def check_favorite():
+    """检查是否已收藏"""
+    from flask import g
+    user_id = g.user_id
+    folder_name = request.args.get('folder_name', '')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            SELECT id FROM user_favorites WHERE user_id = %s AND folder_name = %s
+        """, (user_id, folder_name))
+        
+        exists = cursor.fetchone() is not None
+        
+        return jsonify({'success': True, 'is_favorited': exists})
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============== 我的花园 API ==============
+
+@bp.route('/garden', methods=['GET'])
+@token_required
+def get_garden():
+    """获取用户花园"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        cursor.execute("""
+            SELECT * FROM user_garden WHERE user_id = %s ORDER BY created_at DESC
+        """, (user_id,))
+        
+        plants = cursor.fetchall()
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'plants': plants,
+                'total': len(plants)
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/garden/<int:plant_id>', methods=['GET'])
+@token_required
+def get_garden_plant(plant_id):
+    """获取单个植物详情（支持查看他人花园）"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        # 先获取植物信息
+        cursor.execute("""
+            SELECT g.*, u.username, u.is_admin
+            FROM user_garden g
+            JOIN users u ON g.user_id = u.id
+            WHERE g.id = %s
+        """, (plant_id,))
+        
+        plant = cursor.fetchone()
+        
+        if not plant:
+            return jsonify({'success': False, 'error': '植物不存在'}), 404
+        
+        # 检查是否是本人的植物
+        is_owner = str(plant['user_id']) == str(user_id)
+        
+        # 如果不是本人，检查隐私设置
+        if not is_owner:
+            # 获取主人的隐私设置
+            cursor.execute("""
+                SELECT garden_visibility FROM user_profiles WHERE user_id = %s
+            """, (plant['user_id'],))
+            profile = cursor.fetchone()
+            
+            visibility = profile['garden_visibility'] if profile else 'public'
+            
+            if visibility == 'private':
+                return jsonify({'success': False, 'error': '对方花园不可见哦~'}), 403
+            
+            # 检查是否在黑名单
+            cursor.execute("""
+                SELECT id FROM user_blacklist 
+                WHERE user_id = %s AND blocked_user_id = %s
+            """, (plant['user_id'], user_id))
+            if cursor.fetchone():
+                return jsonify({'success': False, 'error': '对方花园不可见哦~'}), 403
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'plant': plant,
+                'is_owner': is_owner
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/garden', methods=['POST'])
+@token_required
+def add_to_garden():
+    """添加到花园"""
+    from flask import g
+    user_id = g.user_id
+    data = request.get_json()
+    
+    flower_id = data.get('flower_id')
+    flower_name = data.get('flower_name')
+    latin_name = data.get('latin_name', '')
+    chinese_name = data.get('chinese_name', '')
+    nickname = data.get('nickname', '')
+    location = data.get('location', '')
+    acquired_date = data.get('acquired_date')
+    status = data.get('status', 'healthy')
+    notes = data.get('notes', '')
+    
+    if not flower_name:
+        return jsonify({'success': False, 'error': '缺少花卉名称'}), 400
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO user_garden 
+            (user_id, flower_id, flower_name, latin_name, chinese_name, 
+             nickname, location, acquired_date, status, notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (user_id, flower_id, flower_name, latin_name, chinese_name,
+              nickname, location, acquired_date, status, notes))
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '已添加到花园'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/garden/<int:plant_id>', methods=['PUT'])
+@token_required
+def update_garden_plant(plant_id):
+    """更新花园植物"""
+    from flask import g
+    user_id = g.user_id
+    data = request.get_json()
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # 构建更新语句
+        updates = []
+        params = []
+        
+        for field in ['nickname', 'location', 'status', 'notes']:
+            if field in data:
+                updates.append(f"{field} = %s")
+                params.append(data[field])
+        
+        if not updates:
+            return jsonify({'success': False, 'error': '没有要更新的字段'}), 400
+        
+        params.extend([plant_id, user_id])
+        
+        cursor.execute(f"""
+            UPDATE user_garden SET {', '.join(updates)}
+            WHERE id = %s AND user_id = %s
+        """, params)
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({'success': False, 'error': '植物不存在'}), 404
+        
+        return jsonify({'success': True, 'message': '更新成功'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/garden/<int:plant_id>', methods=['DELETE'])
+@token_required
+def remove_from_garden(plant_id):
+    """从花园移除"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            DELETE FROM user_garden WHERE id = %s AND user_id = %s
+        """, (plant_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({'success': False, 'error': '植物不存在'}), 404
+        
+        return jsonify({'success': True, 'message': '已从花园移除'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============== 养护提醒 API ==============
+
+@bp.route('/reminders', methods=['GET'])
+@token_required
+def get_reminders():
+    """获取养护提醒列表"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        cursor.execute("""
+            SELECT * FROM care_reminders 
+            WHERE user_id = %s AND is_active = 1
+            ORDER BY next_reminder ASC
+        """, (user_id,))
+        
+        reminders = cursor.fetchall()
+        
+        # 转换提醒类型为中文
+        type_map = {
+            'water': '浇水',
+            'fertilize': '施肥',
+            'prune': '修剪',
+            'repot': '换盆',
+            'other': '其他'
+        }
+        for r in reminders:
+            r['type_name'] = type_map.get(r['reminder_type'], '其他')
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'reminders': reminders,
+                'total': len(reminders)
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/reminders/today', methods=['GET'])
+@token_required
+def get_today_reminders():
+    """获取今日提醒"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        cursor.execute("""
+            SELECT * FROM care_reminders 
+            WHERE user_id = %s AND is_active = 1 
+            AND next_reminder <= CURDATE() + INTERVAL 1 DAY
+            ORDER BY next_reminder ASC
+        """, (user_id,))
+        
+        reminders = cursor.fetchall()
+        
+        type_map = {
+            'water': '浇水',
+            'fertilize': '施肥',
+            'prune': '修剪',
+            'repot': '换盆',
+            'other': '其他'
+        }
+        for r in reminders:
+            r['type_name'] = type_map.get(r['reminder_type'], '其他')
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'reminders': reminders,
+                'total': len(reminders)
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/reminders', methods=['POST'])
+@token_required
+def add_reminder():
+    """添加养护提醒"""
+    from flask import g
+    user_id = g.user_id
+    data = request.get_json()
+    
+    flower_id = data.get('flower_id')
+    flower_name = data.get('flower_name', '')
+    reminder_type = data.get('reminder_type', 'water')
+    frequency_days = data.get('frequency_days', 7)
+    next_reminder = data.get('next_reminder')
+    notes = data.get('notes', '')
+    
+    if not flower_name:
+        return jsonify({'success': False, 'error': '缺少花卉名称'}), 400
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO care_reminders 
+            (user_id, flower_id, flower_name, reminder_type, frequency_days, next_reminder, notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (user_id, flower_id, flower_name, reminder_type, frequency_days, next_reminder, notes))
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '提醒已添加'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/reminders/<int:reminder_id>/done', methods=['POST'])
+@token_required
+def mark_reminder_done(reminder_id):
+    """标记提醒完成"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        cursor.execute("""
+            SELECT * FROM care_reminders WHERE id = %s AND user_id = %s
+        """, (reminder_id, user_id))
+        reminder = cursor.fetchone()
+        
+        if not reminder:
+            return jsonify({'success': False, 'error': '提醒不存在'}), 404
+        
+        # 更新完成日期和下次提醒日期
+        import datetime
+        next_date = datetime.date.today() + datetime.timedelta(days=reminder['frequency_days'])
+        
+        cursor.execute("""
+            UPDATE care_reminders 
+            SET last_done = CURDATE(), next_reminder = %s
+            WHERE id = %s
+        """, (next_date, reminder_id))
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '已完成，下次提醒已更新'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/reminders/<int:reminder_id>', methods=['DELETE'])
+@token_required
+def delete_reminder(reminder_id):
+    """删除提醒"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            DELETE FROM care_reminders WHERE id = %s AND user_id = %s
+        """, (reminder_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({'success': False, 'error': '提醒不存在'}), 404
+        
+        return jsonify({'success': True, 'message': '已删除'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============== 花友圈 API ==============
+
+@bp.route('/posts', methods=['GET'])
+def get_posts():
+    """获取帖子列表"""
+    page = int(request.args.get('page', 1))
+    page_size = int(request.args.get('page_size', 10))
+    user_id = request.args.get('user_id')  # 可选：只看某用户的帖子
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        where = "WHERE 1=1"
+        params = []
+        
+        if user_id:
+            where += " AND p.user_id = %s"
+            params.append(user_id)
+        
+        # 查询总数
+        cursor.execute(f"SELECT COUNT(*) as total FROM posts p {where}", params)
+        total = cursor.fetchone()['total']
+        
+        # 分页查询
+        offset = (page - 1) * page_size
+        cursor.execute(f"""
+            SELECT p.*, 
+                   CASE WHEN l.id IS NOT NULL THEN 1 ELSE 0 END as is_liked
+            FROM posts p
+            LEFT JOIN likes l ON p.id = l.post_id AND l.user_id = %s
+            {where}
+            ORDER BY p.is_top DESC, p.created_at DESC
+            LIMIT %s OFFSET %s
+        """, [request.headers.get('X-User-Id', '')] + params + [page_size, offset])
+        
+        posts = cursor.fetchall()
+        
+        # 解析 images JSON
+        for post in posts:
+            if post['images']:
+                try:
+                    post['images'] = json.loads(post['images'])
+                except:
+                    post['images'] = []
+            if post.get('topics'):
+                try:
+                    post['topics'] = json.loads(post['topics'])
+                except:
+                    post['topics'] = []
+            if post.get('mentions'):
+                try:
+                    post['mentions'] = json.loads(post['mentions'])
+                except:
+                    post['mentions'] = []
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'posts': posts,
+                'total': total,
+                'page': page,
+                'page_size': page_size,
+                'total_pages': (total + page_size - 1) // page_size
+            }
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/posts', methods=['POST'])
+@token_required
+def create_post():
+    """发布帖子"""
+    from flask import g
+    user_id = g.user_id
+    username = g.user.get('username', '匿名用户')
+    user_avatar = g.user.get('avatar_url', '')
+    
+    data = request.get_json()
+    
+    content = data.get('content', '').strip()
+    images = data.get('images', [])
+    video_url = data.get('video_url')
+    flower_id = data.get('flower_id')
+    flower_name = data.get('flower_name')
+    topics = data.get('topics', [])
+    mentions = data.get('mentions', [])
+    
+    if not content:
+        return jsonify({'success': False, 'error': '内容不能为空'}), 400
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO posts 
+            (user_id, username, user_avatar, content, images, video_url, flower_id, flower_name, topics, mentions)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (user_id, username, user_avatar, content, 
+              json.dumps(images, ensure_ascii=False) if images else None,
+              video_url, flower_id, flower_name,
+              json.dumps(topics, ensure_ascii=False) if topics else None,
+              json.dumps(mentions, ensure_ascii=False) if mentions else None))
+        conn.commit()
+        
+        post_id = cursor.lastrowid
+        
+        # 更新用户发帖数
+        cursor.execute("UPDATE user_profiles SET posts_count = posts_count + 1 WHERE user_id = %s", (user_id,))
+        conn.commit()
+        
+        # 添加经验值：发布内容+10
+        add_experience(user_id, 'post', '发布帖子')
+        
+        return jsonify({
+            'success': True, 
+            'message': '发布成功',
+            'post_id': post_id
+        })
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============== 内容审核 API ==============
+
+@bp.route('/audit/list', methods=['GET'])
+@token_required
+def get_audit_list():
+    """获取审核列表"""
+    from flask import g
+    
+    # 检查管理员权限
+    if not g.user.get('is_admin'):
+        return jsonify({'success': False, 'error': '需要管理员权限'}), 403
+    
+    page = int(request.args.get('page', 1))
+    page_size = int(request.args.get('page_size', 10))
+    status = request.args.get('status', 'pending')
+    
+    if status not in ['pending', 'approved', 'rejected']:
+        status = 'pending'
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        offset = (page - 1) * page_size
+        
+        cursor.execute("""
+            SELECT COUNT(*) as total FROM posts WHERE status = %s
+        """, (status,))
+        total = cursor.fetchone()['total']
+        
+        cursor.execute("""
+            SELECT p.*, u.username as author_name
+            FROM posts p
+            LEFT JOIN users u ON p.user_id = u.id
+            WHERE p.status = %s
+            ORDER BY p.created_at DESC
+            LIMIT %s OFFSET %s
+        """, (status, page_size, offset))
+        
+        posts = cursor.fetchall()
+        
+        for post in posts:
+            if post['images']:
+                try:
+                    post['images'] = json.loads(post['images'])
+                except:
+                    post['images'] = []
+            if post.get('topics'):
+                try:
+                    post['topics'] = json.loads(post['topics'])
+                except:
+                    post['topics'] = []
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'posts': posts,
+                'total': total,
+                'page': page,
+                'page_size': page_size,
+                'total_pages': (total + page_size - 1) // page_size if total > 0 else 0
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# 保留旧接口兼容
+@bp.route('/audit/pending', methods=['GET'])
+@token_required
+def get_pending_posts():
+    """获取待审核帖子（兼容旧接口）"""
+    return get_audit_list()
+
+
+@bp.route('/audit/<int:post_id>/approve', methods=['POST'])
+@token_required
+def approve_post(post_id):
+    """审核通过帖子"""
+    from flask import g
+    
+    if not g.user.get('is_admin'):
+        return jsonify({'success': False, 'error': '需要管理员权限'}), 403
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("UPDATE posts SET status = 'approved' WHERE id = %s", (post_id,))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({'success': False, 'error': '帖子不存在'}), 404
+        
+        return jsonify({'success': True, 'message': '审核通过'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/audit/<int:post_id>/reject', methods=['POST'])
+@token_required
+def reject_post(post_id):
+    """审核拒绝帖子"""
+    from flask import g
+    
+    if not g.user.get('is_admin'):
+        return jsonify({'success': False, 'error': '需要管理员权限'}), 403
+    
+    data = request.get_json() or {}
+    reason = data.get('reason', '')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("UPDATE posts SET status = 'rejected' WHERE id = %s", (post_id,))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({'success': False, 'error': '帖子不存在'}), 404
+        
+        return jsonify({'success': True, 'message': '已拒绝'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/posts/<int:post_id>', methods=['DELETE'])
+@token_required
+def delete_post(post_id):
+    """删除帖子"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            DELETE FROM posts WHERE id = %s AND user_id = %s
+        """, (post_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({'success': False, 'error': '帖子不存在或无权删除'}), 404
+        
+        return jsonify({'success': True, 'message': '已删除'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/posts/<int:post_id>/like', methods=['POST'])
+@token_required
+def toggle_like(post_id):
+    """点赞/取消点赞"""
+    from flask import g
+    user_id = g.user_id
+    username = g.user.get('username', '匿名用户')
+    user_avatar = g.user.get('avatar_url', '')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        # 获取帖子作者信息
+        cursor.execute("SELECT user_id, content FROM posts WHERE id = %s", (post_id,))
+        post = cursor.fetchone()
+        if not post:
+            return jsonify({'success': False, 'error': '帖子不存在'}), 404
+        
+        post_author_id = post['user_id']
+        post_content = (post['content'] or '')[:50] if post['content'] else '帖子'
+        
+        # 检查是否已点赞
+        cursor.execute("""
+            SELECT id FROM likes WHERE post_id = %s AND user_id = %s
+        """, (post_id, user_id))
+        existing = cursor.fetchone()
+        
+        if existing:
+            # 取消点赞
+            cursor.execute("""
+                DELETE FROM likes WHERE post_id = %s AND user_id = %s
+            """, (post_id, user_id))
+            cursor.execute("""
+                UPDATE posts SET likes_count = likes_count - 1 WHERE id = %s
+            """, (post_id,))
+            conn.commit()
+            liked = False
+        else:
+            # 添加点赞
+            cursor.execute("""
+                INSERT INTO likes (post_id, user_id) VALUES (%s, %s)
+            """, (post_id, user_id))
+            cursor.execute("""
+                UPDATE posts SET likes_count = likes_count + 1 WHERE id = %s
+            """, (post_id,))
+            conn.commit()
+            liked = True
+            
+            # 添加经验值：点赞+1
+            add_experience(user_id, 'like', '点赞帖子')
+            
+            # 发送点赞通知
+            create_notification(
+                user_id=post_author_id,
+                actor_id=user_id,
+                actor_name=username,
+                actor_avatar=user_avatar,
+                notification_type='like',
+                target_type='post',
+                target_id=post_id,
+                target_content=post_content
+            )
+        
+        # 获取最新点赞数
+        cursor.execute("SELECT likes_count FROM posts WHERE id = %s", (post_id,))
+        likes_count = cursor.fetchone()[0]
+        
+        return jsonify({
+            'success': True,
+            'liked': liked,
+            'likes_count': likes_count
+        })
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/posts/<int:post_id>/favorite', methods=['POST'])
+@token_required
+def toggle_favorite(post_id):
+    """收藏/取消收藏帖子"""
+    from flask import g
+    user_id = g.user_id
+    username = g.user.get('username', '匿名用户')
+    user_avatar = g.user.get('avatar_url', '')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        # 检查帖子是否存在
+        cursor.execute("SELECT user_id, content FROM posts WHERE id = %s", (post_id,))
+        post = cursor.fetchone()
+        if not post:
+            return jsonify({'success': False, 'error': '帖子不存在'}), 404
+        
+        post_author_id = post['user_id']
+        post_content = (post['content'] or '')[:50] if post['content'] else '帖子'
+        
+        # 检查是否已收藏
+        cursor.execute("""
+            SELECT id FROM post_favorites WHERE post_id = %s AND user_id = %s
+        """, (post_id, user_id))
+        existing = cursor.fetchone()
+        
+        if existing:
+            # 取消收藏
+            cursor.execute("""
+                DELETE FROM post_favorites WHERE post_id = %s AND user_id = %s
+            """, (post_id, user_id))
+            cursor.execute("""
+                UPDATE posts SET favorites_count = favorites_count - 1 WHERE id = %s
+            """, (post_id,))
+            conn.commit()
+            favorited = False
+        else:
+            # 添加收藏
+            cursor.execute("""
+                INSERT INTO post_favorites (post_id, user_id) VALUES (%s, %s)
+            """, (post_id, user_id))
+            cursor.execute("""
+                UPDATE posts SET favorites_count = favorites_count + 1 WHERE id = %s
+            """, (post_id,))
+            conn.commit()
+            favorited = True
+            
+            # 添加经验值：收藏+2
+            add_experience(user_id, 'like', '收藏帖子')
+            
+            # 发送收藏通知
+            create_notification(
+                user_id=post_author_id,
+                actor_id=user_id,
+                actor_name=username,
+                actor_avatar=user_avatar,
+                notification_type='like',
+                target_type='post',
+                target_id=post_id,
+                target_content=post_content
+            )
+        
+        # 获取最新收藏数
+        cursor.execute("SELECT favorites_count FROM posts WHERE id = %s", (post_id,))
+        result = cursor.fetchone()
+        favorites_count = result['favorites_count'] if result else 0
+        
+        return jsonify({
+            'success': True,
+            'favorited': favorited,
+            'favorites_count': favorites_count
+        })
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============== 评论 API ==============
+
+@bp.route('/posts/<int:post_id>/comments', methods=['GET'])
+def get_comments(post_id):
+    """获取评论列表"""
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        cursor.execute("""
+            SELECT * FROM comments WHERE post_id = %s ORDER BY created_at ASC
+        """, (post_id,))
+        
+        comments = cursor.fetchall()
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'comments': comments,
+                'total': len(comments)
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/posts/<int:post_id>/comments', methods=['POST'])
+@token_required
+def add_comment(post_id):
+    """添加评论"""
+    from flask import g
+    user_id = g.user_id
+    username = g.user.get('username', '匿名用户')
+    user_avatar = g.user.get('avatar_url', '')
+    
+    data = request.get_json()
+    content = data.get('content', '').strip()
+    
+    if not content:
+        return jsonify({'success': False, 'error': '评论内容不能为空'}), 400
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        # 获取帖子作者信息
+        cursor.execute("SELECT user_id, content FROM posts WHERE id = %s", (post_id,))
+        post = cursor.fetchone()
+        if not post:
+            return jsonify({'success': False, 'error': '帖子不存在'}), 404
+        
+        post_author_id = post['user_id']
+        post_content = (post['content'] or '')[:50] if post['content'] else '帖子'
+        
+        cursor.execute("""
+            INSERT INTO comments (post_id, user_id, username, user_avatar, content)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (post_id, user_id, username, user_avatar, content))
+        
+        # 更新评论数
+        cursor.execute("""
+            UPDATE posts SET comments_count = comments_count + 1 WHERE id = %s
+        """, (post_id,))
+        
+        conn.commit()
+        
+        # 添加经验值：评论+2
+        add_experience(user_id, 'comment', '评论帖子')
+        
+        # 发送评论通知
+        create_notification(
+            user_id=post_author_id,
+            actor_id=user_id,
+            actor_name=username,
+            actor_avatar=user_avatar,
+            notification_type='comment',
+            target_type='post',
+            target_id=post_id,
+            target_content=post_content
+        )
+        
+        return jsonify({'success': True, 'message': '评论成功'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============== 花园照片记录 API ==============
+
+@bp.route('/garden/<int:plant_id>/photos', methods=['GET'])
+@token_required
+def get_garden_photos(plant_id):
+    """获取花园植物的照片记录"""
+    from flask import g, request
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        # 验证植物属于当前用户
+        cursor.execute("SELECT * FROM user_garden WHERE id = %s AND user_id = %s", (plant_id, user_id))
+        plant = cursor.fetchone()
+        if not plant:
+            return jsonify({'success': False, 'error': '植物不存在'}), 404
+        
+        # 获取照片记录
+        cursor.execute("""
+            SELECT * FROM garden_photos 
+            WHERE garden_id = %s 
+            ORDER BY recorded_date DESC, created_at DESC
+        """, (plant_id,))
+        photos = cursor.fetchall()
+        
+        # 生成完整的图片URL
+        base_url = request.host_url.rstrip('/')
+        for photo in photos:
+            if photo['image_url'] and not photo['image_url'].startswith('http'):
+                photo['image_url'] = base_url + photo['image_url']
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'plant': plant,
+                'photos': photos,
+                'total': len(photos)
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/garden/<int:plant_id>/photos', methods=['POST'])
+@token_required
+def add_garden_photo(plant_id):
+    """添加花园植物的照片记录"""
+    from flask import g, url_for
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # 验证植物属于当前用户
+        cursor.execute("SELECT * FROM user_garden WHERE id = %s AND user_id = %s", (plant_id, user_id))
+        if not cursor.fetchone():
+            return jsonify({'success': False, 'error': '植物不存在'}), 404
+        
+        # 获取表单数据
+        notes = request.form.get('notes', '')
+        recorded_date = request.form.get('recorded_date')
+        
+        if not recorded_date:
+            import datetime
+            recorded_date = datetime.date.today().isoformat()
+        
+        image_url = ''
+        
+        # 处理图片上传
+        if 'image' in request.files:
+            file = request.files['image']
+            if file and file.filename:
+                # 获取文件扩展名
+                ext = os.path.splitext(file.filename)[1].lower()
+                if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+                    ext = '.jpg'
+                
+                # 生成唯一文件名
+                filename = f"{uuid.uuid4().hex}{ext}"
+                filepath = os.path.join(GARDEN_PHOTOS_DIR, filename)
+                
+                # 保存文件
+                file.save(filepath)
+                
+                # 生成URL
+                image_url = f"/static/garden_photos/{filename}"
+        
+        cursor.execute("""
+            INSERT INTO garden_photos (garden_id, user_id, image_url, notes, recorded_date)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (plant_id, user_id, image_url, notes, recorded_date))
+        conn.commit()
+        
+        photo_id = cursor.lastrowid
+        
+        return jsonify({
+            'success': True, 
+            'message': '照片记录已添加',
+            'photo_id': photo_id,
+            'image_url': image_url
+        })
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/garden/photos/<int:photo_id>', methods=['DELETE'])
+@token_required
+def delete_garden_photo(photo_id):
+    """删除花园植物的照片记录"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            DELETE FROM garden_photos WHERE id = %s AND user_id = %s
+        """, (photo_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({'success': False, 'error': '照片记录不存在'}), 404
+        
+        return jsonify({'success': True, 'message': '已删除'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============== 花园日志 API ==============
+
+@bp.route('/garden/<int:plant_id>/diary', methods=['GET'])
+@token_required
+def get_diary_entries(plant_id):
+    """获取花园植物的日志记录"""
+    from flask import g, request
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        # 验证植物属于当前用户
+        cursor.execute("SELECT * FROM user_garden WHERE id = %s AND user_id = %s", (plant_id, user_id))
+        if not cursor.fetchone():
+            return jsonify({'success': False, 'error': '植物不存在'}), 404
+        
+        # 获取日志记录
+        cursor.execute("""
+            SELECT * FROM garden_diary_entries 
+            WHERE garden_id = %s 
+            ORDER BY diary_date DESC, created_at DESC
+        """, (plant_id,))
+        entries = cursor.fetchall()
+        
+        # 生成完整的图片URL
+        base_url = request.host_url.rstrip('/')
+        for entry in entries:
+            if entry.get('image_url') and not entry['image_url'].startswith('http'):
+                entry['image_url'] = base_url + entry['image_url']
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'entries': entries,
+                'total': len(entries)
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/garden/<int:plant_id>/diary', methods=['POST'])
+@token_required
+def add_diary_entry(plant_id):
+    """添加花园日志（支持图片）"""
+    from flask import g, request
+    user_id = g.user_id
+    
+    # 支持表单数据和JSON
+    if request.content_type and 'multipart/form-data' in request.content_type:
+        diary_date = request.form.get('diary_date')
+        content = request.form.get('content', '').strip()
+        mood = request.form.get('mood', 'normal')
+        weather = request.form.get('weather', '')
+    else:
+        data = request.get_json() or {}
+        diary_date = data.get('diary_date')
+        content = data.get('content', '').strip()
+        mood = data.get('mood', 'normal')
+        weather = data.get('weather', '')
+    
+    if not diary_date or not content:
+        return jsonify({'success': False, 'error': '日期和内容不能为空'}), 400
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # 验证植物属于当前用户
+        cursor.execute("SELECT * FROM user_garden WHERE id = %s AND user_id = %s", (plant_id, user_id))
+        if not cursor.fetchone():
+            return jsonify({'success': False, 'error': '植物不存在'}), 404
+        
+        image_url = ''
+        # 处理图片上传
+        if request.content_type and 'multipart/form-data' in request.content_type:
+            if 'image' in request.files:
+                file = request.files['image']
+                if file and file.filename:
+                    ext = os.path.splitext(file.filename)[1].lower()
+                    if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+                        ext = '.jpg'
+                    filename = f"{uuid.uuid4().hex}{ext}"
+                    filepath = os.path.join(GARDEN_PHOTOS_DIR, filename)
+                    file.save(filepath)
+                    image_url = f"/static/garden_photos/{filename}"
+        
+        cursor.execute("""
+            INSERT INTO garden_diary_entries (garden_id, user_id, diary_date, content, mood, weather, image_url)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (plant_id, user_id, diary_date, content, mood, weather, image_url))
+        conn.commit()
+        
+        entry_id = cursor.lastrowid
+        
+        return jsonify({
+            'success': True,
+            'message': '日志已添加',
+            'entry_id': entry_id
+        })
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/diary/<int:entry_id>', methods=['PUT'])
+@token_required
+def update_diary_entry(entry_id):
+    """更新日志"""
+    from flask import g
+    user_id = g.user_id
+    data = request.get_json()
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            UPDATE garden_diary_entries 
+            SET content = %s, mood = %s, weather = %s
+            WHERE id = %s AND user_id = %s
+        """, (data.get('content', ''), data.get('mood', 'normal'), 
+              data.get('weather', ''), entry_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({'success': False, 'error': '日志不存在或无权修改'}), 404
+        
+        return jsonify({'success': True, 'message': '日志已更新'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/diary/<int:entry_id>', methods=['DELETE'])
+@token_required
+def delete_diary_entry(entry_id):
+    """删除日志"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            DELETE FROM garden_diary_entries WHERE id = %s AND user_id = %s
+        """, (entry_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({'success': False, 'error': '日志不存在'}), 404
+        
+        return jsonify({'success': True, 'message': '已删除'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============== 养护计划 API ==============
+
+@bp.route('/garden/<int:plant_id>/schedules', methods=['GET'])
+@token_required
+def get_care_schedules(plant_id):
+    """获取养护计划列表"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        cursor.execute("SELECT * FROM user_garden WHERE id = %s AND user_id = %s", (plant_id, user_id))
+        if not cursor.fetchone():
+            return jsonify({'success': False, 'error': '植物不存在'}), 404
+        
+        cursor.execute("""
+            SELECT * FROM garden_care_schedules 
+            WHERE garden_id = %s AND is_active = 1
+            ORDER BY next_due ASC
+        """, (plant_id,))
+        schedules = cursor.fetchall()
+        
+        return jsonify({
+            'success': True,
+            'data': {'schedules': schedules}
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/garden/<int:plant_id>/schedules', methods=['POST'])
+@token_required
+def add_care_schedule(plant_id):
+    """添加养护计划"""
+    from flask import g
+    user_id = g.user_id
+    data = request.get_json()
+    
+    care_type = data.get('care_type', 'water')  # water/fertilize/prune/repot/other
+    frequency_days = data.get('frequency_days', 7)
+    notes = data.get('notes', '')
+    
+    if care_type not in ['water', 'fertilize', 'prune', 'repot', 'other']:
+        return jsonify({'success': False, 'error': '无效的养护类型'}), 400
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("SELECT * FROM user_garden WHERE id = %s AND user_id = %s", (plant_id, user_id))
+        if not cursor.fetchone():
+            return jsonify({'success': False, 'error': '植物不存在'}), 404
+        
+        import datetime
+        today = datetime.date.today()
+        next_due = today + datetime.timedelta(days=frequency_days)
+        
+        cursor.execute("""
+            INSERT INTO garden_care_schedules 
+            (garden_id, user_id, care_type, frequency_days, next_due, notes)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (plant_id, user_id, care_type, frequency_days, next_due, notes))
+        conn.commit()
+        
+        schedule_id = cursor.lastrowid
+        
+        # 生成通知
+        _generate_care_notification(user_id, plant_id, care_type, next_due, notes)
+        
+        return jsonify({
+            'success': True,
+            'message': '计划已添加',
+            'schedule_id': schedule_id
+        })
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/schedules/<int:schedule_id>/complete', methods=['POST'])
+@token_required
+def complete_care(schedule_id):
+    """完成一次养护"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        cursor.execute("""
+            SELECT * FROM garden_care_schedules WHERE id = %s AND user_id = %s
+        """, (schedule_id, user_id))
+        schedule = cursor.fetchone()
+        
+        if not schedule:
+            return jsonify({'success': False, 'error': '计划不存在'}), 404
+        
+        import datetime
+        today = datetime.date.today()
+        
+        # 更新计划
+        cursor.execute("""
+            UPDATE garden_care_schedules 
+            SET last_done = %s, next_due = DATE_ADD(%s, INTERVAL frequency_days DAY)
+            WHERE id = %s
+        """, (today, today, schedule_id))
+        
+        # 记录历史
+        cursor.execute("""
+            INSERT INTO garden_care_logs (schedule_id, garden_id, user_id, care_type, care_date)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (schedule_id, schedule['garden_id'], user_id, schedule['care_type'], today))
+        
+        # 更新植物上次养护时间
+        if schedule['care_type'] == 'water':
+            cursor.execute("""
+                UPDATE user_garden SET last_watered = %s WHERE id = %s
+            """, (today, schedule['garden_id']))
+        elif schedule['care_type'] == 'fertilize':
+            cursor.execute("""
+                UPDATE user_garden SET last_fertilized = %s WHERE id = %s
+            """, (today, schedule['garden_id']))
+        
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '养护完成'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/schedules/<int:schedule_id>', methods=['DELETE'])
+@token_required
+def delete_schedule(schedule_id):
+    """删除养护计划"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            UPDATE garden_care_schedules SET is_active = 0 WHERE id = %s AND user_id = %s
+        """, (schedule_id, user_id))
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '计划已删除'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/schedules/all', methods=['GET'])
+@token_required
+def get_all_schedules():
+    """获取用户所有养护计划"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        cursor.execute("""
+            SELECT s.*, g.nickname, g.flower_name, g.latin_name
+            FROM garden_care_schedules s
+            JOIN user_garden g ON s.garden_id = g.id
+            WHERE s.user_id = %s AND s.is_active = 1
+            ORDER BY s.next_due ASC
+        """, (user_id,))
+        schedules = cursor.fetchall()
+        
+        return jsonify({
+            'success': True,
+            'data': {'schedules': schedules}
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _generate_care_notification(user_id, garden_id, care_type, due_date, notes=''):
+    """生成养护通知"""
+    care_type_names = {
+        'water': '浇水',
+        'fertilize': '施肥',
+        'prune': '修剪',
+        'repot': '换盆',
+        'other': '养护'
+    }
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        title = f"🌱 {care_type_names.get(care_type, '养护')}提醒"
+        content = f"您的植物需要在 {due_date} 进行{care_type_names.get(care_type, '养护')}"
+        if notes:
+            content += f"（{notes}）"
+        
+        cursor.execute("""
+            INSERT INTO care_notifications 
+            (user_id, garden_id, notification_type, title, content, due_date)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (user_id, garden_id, care_type, title, content, due_date))
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============== 消息通知 API ==============
+
+@bp.route('/notifications', methods=['GET'])
+@token_required
+def get_notifications():
+    """获取消息通知列表（仅返回当天到期的养护通知）"""
+    from flask import g
+    import datetime
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        today = datetime.date.today().isoformat()
+        
+        # 先检查是否有当天到期的养护计划需要生成通知
+        cursor.execute("""
+            SELECT s.*, g.nickname, g.flower_name
+            FROM garden_care_schedules s
+            JOIN user_garden g ON s.garden_id = g.id
+            WHERE s.user_id = %s AND s.is_active = 1 AND s.next_due = %s
+        """, (user_id, today))
+        due_schedules = cursor.fetchall()
+        
+        care_type_names = {
+            'water': '浇水',
+            'fertilize': '施肥',
+            'prune': '修剪',
+            'repot': '换盆',
+            'other': '养护'
+        }
+        
+        # 为当天到期的计划生成通知
+        for schedule in due_schedules:
+            plant_name = schedule['nickname'] or schedule['flower_name']
+            care_name = care_type_names.get(schedule['care_type'], '养护')
+            
+            # 检查是否已存在相同通知
+            cursor.execute("""
+                SELECT id FROM care_notifications 
+                WHERE user_id = %s AND garden_id = %s AND notification_type = %s AND due_date = %s
+            """, (user_id, schedule['garden_id'], schedule['care_type'], today))
+            
+            if not cursor.fetchone():
+                title = f"🌱 {care_name}提醒"
+                content = f"您的「{plant_name}」今天需要{care_name}"
+                if schedule.get('notes'):
+                    content += f"（{schedule['notes']}）"
+                
+                cursor.execute("""
+                    INSERT INTO care_notifications 
+                    (user_id, garden_id, notification_type, title, content, due_date)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (user_id, schedule['garden_id'], schedule['care_type'], title, content, today))
+        
+        conn.commit()
+        
+        # 获取当天到期的通知
+        cursor.execute("""
+            SELECT n.*, g.nickname, g.flower_name
+            FROM care_notifications n
+            LEFT JOIN user_garden g ON n.garden_id = g.id
+            WHERE n.user_id = %s AND n.is_dismissed = 0 AND n.due_date = %s
+            ORDER BY n.created_at DESC
+            LIMIT 50
+        """, (user_id, today))
+        notifications = cursor.fetchall()
+        
+        # 统计未读数（仅当天）
+        cursor.execute("""
+            SELECT COUNT(*) as unread_count FROM care_notifications
+            WHERE user_id = %s AND is_read = 0 AND is_dismissed = 0 AND due_date = %s
+        """, (user_id, today))
+        unread_count = cursor.fetchone()['unread_count']
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'notifications': notifications,
+                'unread_count': unread_count,
+                'date': today
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/notifications/<int:notification_id>/read', methods=['PUT'])
+@token_required
+def mark_notification_read(notification_id):
+    """标记通知为已读"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            UPDATE care_notifications SET is_read = 1 WHERE id = %s AND user_id = %s
+        """, (notification_id, user_id))
+        conn.commit()
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/notifications/read-all', methods=['PUT'])
+@token_required
+def mark_all_read():
+    """标记所有通知为已读"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            UPDATE care_notifications SET is_read = 1 WHERE user_id = %s AND is_read = 0
+        """, (user_id,))
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '全部已读'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/notifications/<int:notification_id>', methods=['DELETE'])
+@token_required
+def dismiss_notification(notification_id):
+    """忽略通知"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            UPDATE care_notifications SET is_dismissed = 1 WHERE id = %s AND user_id = %s
+        """, (notification_id, user_id))
+        conn.commit()
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
