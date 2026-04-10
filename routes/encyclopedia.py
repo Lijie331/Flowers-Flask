@@ -210,7 +210,8 @@ morphology, habitat, growth_habit, ornamental_value,
         """, (flower_id,))
         
         columns = [desc[0] for desc in cursor.description]
-        flower = dict(zip(columns, cursor.fetchone())) if cursor.fetchone() else None
+        row = cursor.fetchone()
+        flower = dict(zip(columns, row)) if row else None
         
         if flower:
             flower = process_image_data(flower)
