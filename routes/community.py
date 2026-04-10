@@ -761,13 +761,19 @@ def get_posts():
         cursor.execute(f"SELECT COUNT(*) as total FROM posts p {where}", params)
         total = cursor.fetchone()['total']
         
-        # 分页查询
+        # 分页查询 - 使用 user_profiles 的 nickname 和 avatar_url
         offset = (page - 1) * page_size
         cursor.execute(f"""
-            SELECT p.*, 
+            SELECT p.id, p.user_id, p.content, p.images, p.video_url, p.flower_id, p.flower_name,
+                   p.topics, p.mentions, p.likes_count, p.comments_count, p.favorites_count,
+                   p.is_top, p.status, p.created_at, p.updated_at,
                    CASE WHEN l.id IS NOT NULL THEN 1 ELSE 0 END as is_liked,
-                   CASE WHEN f.id IS NOT NULL THEN 1 ELSE 0 END as is_favorited
+                   CASE WHEN f.id IS NOT NULL THEN 1 ELSE 0 END as is_favorited,
+                   COALESCE(NULLIF(pf.nickname, ''), u.username, p.username) as username,
+                   COALESCE(NULLIF(pf.avatar_url, ''), p.user_avatar, NULLIF(u.avatar_url, '')) as user_avatar
             FROM posts p
+            LEFT JOIN users u ON p.user_id = u.id
+            LEFT JOIN user_profiles pf ON p.user_id = pf.user_id
             LEFT JOIN likes l ON p.id = l.post_id AND l.user_id = %s
             LEFT JOIN post_favorites f ON p.id = f.post_id AND f.user_id = %s
             {where}
@@ -820,8 +826,17 @@ def create_post():
     """发布帖子"""
     from flask import g
     user_id = g.user_id
-    username = g.user.get('username', '匿名用户')
-    user_avatar = g.user.get('avatar_url', '')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    # 从 user_profiles 获取 nickname 和 avatar_url
+    cursor.execute("SELECT nickname, avatar_url FROM user_profiles WHERE user_id = %s", (user_id,))
+    profile = cursor.fetchone()
+    
+    username = profile['nickname'] if profile and profile['nickname'] else g.user.get('username', '匿名用户')
+    user_avatar = profile['avatar_url'] if profile and profile['avatar_url'] else g.user.get('avatar_url', '')
+    cursor.close()
     
     data = request.get_json()
     
@@ -834,9 +849,9 @@ def create_post():
     mentions = data.get('mentions', [])
     
     if not content:
+        conn.close()
         return jsonify({'success': False, 'error': '内容不能为空'}), 400
     
-    conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
@@ -1042,11 +1057,15 @@ def toggle_like(post_id):
     """点赞/取消点赞"""
     from flask import g
     user_id = g.user_id
-    username = g.user.get('username', '匿名用户')
-    user_avatar = g.user.get('avatar_url', '')
     
     conn = get_db_connection()
     cursor = conn.cursor(DictCursor)
+    
+    # 从 user_profiles 获取 nickname 和 avatar_url
+    cursor.execute("SELECT nickname, avatar_url FROM user_profiles WHERE user_id = %s", (user_id,))
+    profile = cursor.fetchone()
+    username = profile['nickname'] if profile and profile['nickname'] else g.user.get('username', '匿名用户')
+    user_avatar = profile['avatar_url'] if profile and profile['avatar_url'] else g.user.get('avatar_url', '')
     
     try:
         # 获取帖子作者信息
@@ -1158,11 +1177,15 @@ def toggle_favorite(post_id):
     """收藏/取消收藏帖子"""
     from flask import g
     user_id = g.user_id
-    username = g.user.get('username', '匿名用户')
-    user_avatar = g.user.get('avatar_url', '')
     
     conn = get_db_connection()
     cursor = conn.cursor(DictCursor)
+    
+    # 从 user_profiles 获取 nickname 和 avatar_url
+    cursor.execute("SELECT nickname, avatar_url FROM user_profiles WHERE user_id = %s", (user_id,))
+    profile = cursor.fetchone()
+    username = profile['nickname'] if profile and profile['nickname'] else g.user.get('username', '匿名用户')
+    user_avatar = profile['avatar_url'] if profile and profile['avatar_url'] else g.user.get('avatar_url', '')
     
     try:
         # 检查帖子是否存在
@@ -1274,8 +1297,14 @@ def get_comments(post_id):
     cursor = conn.cursor(DictCursor)
     
     try:
+        # JOIN user_profiles 获取 nickname 和 avatar_url（显式列出需要的字段）
         cursor.execute("""
-            SELECT * FROM comments WHERE post_id = %s ORDER BY created_at ASC
+            SELECT c.id, c.post_id, c.user_id, c.content, c.created_at, c.updated_at,
+                   COALESCE(NULLIF(pf.nickname, ''), c.username) as username, 
+                   COALESCE(NULLIF(pf.avatar_url, ''), c.user_avatar) as user_avatar
+            FROM comments c
+            LEFT JOIN user_profiles pf ON c.user_id = pf.user_id
+            WHERE c.post_id = %s ORDER BY c.created_at ASC
         """, (post_id,))
         
         comments = cursor.fetchall()
@@ -1300,17 +1329,23 @@ def add_comment(post_id):
     """添加评论"""
     from flask import g
     user_id = g.user_id
-    username = g.user.get('username', '匿名用户')
-    user_avatar = g.user.get('avatar_url', '')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    # 从 user_profiles 获取 nickname 和 avatar_url
+    cursor.execute("SELECT nickname, avatar_url FROM user_profiles WHERE user_id = %s", (user_id,))
+    profile = cursor.fetchone()
+    username = profile['nickname'] if profile and profile['nickname'] else g.user.get('username', '匿名用户')
+    user_avatar = profile['avatar_url'] if profile and profile['avatar_url'] else g.user.get('avatar_url', '')
     
     data = request.get_json()
     content = data.get('content', '').strip()
     
     if not content:
+        cursor.close()
+        conn.close()
         return jsonify({'success': False, 'error': '评论内容不能为空'}), 400
-    
-    conn = get_db_connection()
-    cursor = conn.cursor(DictCursor)
     
     try:
         # 获取帖子作者信息
