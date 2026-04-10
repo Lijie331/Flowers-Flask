@@ -763,6 +763,13 @@ def get_posts():
         
         # 分页查询 - 使用 user_profiles 的 nickname 和 avatar_url
         offset = (page - 1) * page_size
+        
+        # 获取当前登录用户的ID（如果有token）
+        from routes.auth import get_user_id_by_token
+        token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        current_user_id = get_user_id_by_token(token) if token else None
+        query_user_id = current_user_id if current_user_id else request.headers.get('X-User-Id', '')
+        
         cursor.execute(f"""
             SELECT p.id, p.user_id, p.content, p.images, p.video_url, p.flower_id, p.flower_name,
                    p.topics, p.mentions, p.likes_count, p.comments_count, p.favorites_count,
@@ -779,7 +786,7 @@ def get_posts():
             {where}
             ORDER BY p.is_top DESC, p.created_at DESC
             LIMIT %s OFFSET %s
-        """, [request.headers.get('X-User-Id', '')] + [request.headers.get('X-User-Id', '')] + params + [page_size, offset])
+        """, [query_user_id, query_user_id] + params + [page_size, offset])
         
         posts = cursor.fetchall()
         
