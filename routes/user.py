@@ -385,3 +385,250 @@ def get_experience_logs():
     finally:
         cursor.close()
         conn.close()
+
+
+# ============== 通知功能 ==============
+
+def init_notifications_table():
+    """初始化通知表"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # 检查表是否存在
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_notifications (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id VARCHAR(8) NOT NULL COMMENT '接收通知的用户ID',
+                actor_id VARCHAR(8) COMMENT '触发通知的用户ID',
+                actor_name VARCHAR(50) COMMENT '触发通知的用户名',
+                actor_avatar VARCHAR(500) COMMENT '触发通知的用户头像',
+                notification_type VARCHAR(20) DEFAULT 'system' COMMENT '通知类型: like/favorite/comment/follow/system',
+                target_type VARCHAR(50) COMMENT '通知对象类型 post/comment/user',
+                target_id INT COMMENT '通知对象ID',
+                target_content TEXT COMMENT '通知对象内容摘要',
+                is_read TINYINT(1) DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_user_id (user_id),
+                INDEX idx_is_read (is_read),
+                INDEX idx_created_at (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户通知表'
+        """)
+        conn.commit()
+        
+        # 检查并更新 notification_type 字段类型（如果需要）
+        try:
+            cursor.execute("""
+                ALTER TABLE user_notifications 
+                MODIFY COLUMN notification_type VARCHAR(20) DEFAULT 'system'
+                COMMENT '通知类型: like/favorite/comment/follow/system'
+            """)
+            conn.commit()
+        except Exception as e:
+            print(f"[INFO] 通知表字段更新: {e}")
+        
+        print("[INFO] 通知表初始化完成")
+        return True
+    except Exception as e:
+        print(f"[ERROR] 通知表初始化失败: {e}")
+        conn.rollback()
+        return False
+    finally:
+        cursor.close()
+        conn.close()
+
+# 模块加载时初始化表
+try:
+    init_notifications_table()
+except:
+    pass
+
+
+def create_notification(user_id, actor_id, actor_name, actor_avatar, notification_type, 
+                       target_type=None, target_id=None, target_content=None):
+    """创建通知"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO user_notifications 
+            (user_id, actor_id, actor_name, actor_avatar, notification_type, 
+             target_type, target_id, target_content)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (user_id, actor_id, actor_name, actor_avatar, notification_type,
+              target_type, target_id, target_content))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[ERROR] 创建通知失败: {e}")
+        return False
+
+
+@bp.route('/notifications', methods=['GET'])
+@token_required
+def get_notifications():
+    """获取通知列表"""
+    from flask import g
+    user_id = g.user_id
+    
+    page = request.args.get('page', 1, type=int)
+    page_size = request.args.get('page_size', 20, type=int)
+    unread_only = request.args.get('unread_only', 'false').lower() == 'true'
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        # 构建查询条件
+        where_clause = "WHERE user_id = %s"
+        params = [user_id]
+        
+        if unread_only:
+            where_clause += " AND is_read = 0"
+        
+        # 获取通知列表
+        cursor.execute(f"""
+            SELECT id, actor_id, actor_name, actor_avatar, notification_type,
+                   target_type, target_id, target_content, is_read, created_at
+            FROM user_notifications
+            {where_clause}
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """, params + [page_size, (page - 1) * page_size])
+        notifications = cursor.fetchall()
+        
+        # 获取未读数量
+        cursor.execute("SELECT COUNT(*) as count FROM user_notifications WHERE user_id = %s AND is_read = 0", (user_id,))
+        unread_count = cursor.fetchone()['count']
+        
+        # 转换通知类型为显示文本
+        type_text_map = {
+            'like': '点赞了你的帖子',
+            'favorite': '收藏了你的帖子',
+            'comment': '评论了你的帖子',
+            'follow': '关注了你',
+            'system': '系统通知'
+        }
+        for n in notifications:
+            n['type_text'] = type_text_map.get(n['notification_type'], '有新通知')
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'notifications': notifications,
+                'unread_count': unread_count,
+                'page': page,
+                'page_size': page_size
+            }
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/notifications/<int:notification_id>/read', methods=['PUT'])
+@token_required
+def mark_notification_read(notification_id):
+    """标记通知为已读"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            UPDATE user_notifications 
+            SET is_read = 1 
+            WHERE id = %s AND user_id = %s
+        """, (notification_id, user_id))
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '已标记为已读'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/notifications/read-all', methods=['PUT'])
+@token_required
+def mark_all_notifications_read():
+    """标记所有通知为已读"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            UPDATE user_notifications 
+            SET is_read = 1 
+            WHERE user_id = %s AND is_read = 0
+        """, (user_id,))
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '已全部标记为已读'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/notifications/<int:notification_id>', methods=['DELETE'])
+@token_required
+def delete_notification(notification_id):
+    """删除通知"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            DELETE FROM user_notifications 
+            WHERE id = %s AND user_id = %s
+        """, (notification_id, user_id))
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '已删除'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/notifications/unread-count', methods=['GET'])
+@token_required
+def get_unread_notification_count():
+    """获取未读通知数量"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        cursor.execute("""
+            SELECT COUNT(*) as count 
+            FROM user_notifications 
+            WHERE user_id = %s AND is_read = 0
+        """, (user_id,))
+        count = cursor.fetchone()['count']
+        
+        return jsonify({'success': True, 'unread_count': count})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()

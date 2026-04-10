@@ -41,18 +41,42 @@ def create_notification(user_id, actor_id, actor_name, actor_avatar, notificatio
     """创建用户通知"""
     # 不给自己发通知
     if str(user_id) == str(actor_id):
-        return
+        return False
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        # 确保表存在
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_notifications (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id VARCHAR(8) NOT NULL,
+                actor_id VARCHAR(8),
+                actor_name VARCHAR(50),
+                actor_avatar VARCHAR(500),
+                notification_type VARCHAR(20) DEFAULT 'system',
+                target_type VARCHAR(50),
+                target_id INT,
+                target_content TEXT,
+                is_read TINYINT(1) DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_user_id (user_id),
+                INDEX idx_is_read (is_read)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        
         cursor.execute("""
             INSERT INTO user_notifications 
             (user_id, actor_id, actor_name, actor_avatar, notification_type, target_type, target_id, target_content)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (user_id, actor_id, actor_name, actor_avatar, notification_type, target_type, target_id, target_content))
         conn.commit()
-    except Exception:
+        print(f"[INFO] 发送通知成功: {actor_name} -> {user_id}, 类型: {notification_type}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] 创建通知失败: {e}")
         conn.rollback()
+        return False
     finally:
         cursor.close()
         conn.close()
@@ -1034,6 +1058,12 @@ def toggle_like(post_id):
         post_author_id = post['user_id']
         post_content = (post['content'] or '')[:50] if post['content'] else '帖子'
         
+        # 不给自己点赞时不发送通知
+        if str(post_author_id) == str(user_id):
+            send_notification = False
+        else:
+            send_notification = True
+        
         # 检查是否已点赞
         cursor.execute("""
             SELECT id FROM likes WHERE post_id = %s AND user_id = %s
@@ -1050,6 +1080,17 @@ def toggle_like(post_id):
             """, (post_id,))
             conn.commit()
             liked = False
+            
+            # 取消点赞时删除之前的通知
+            if send_notification:
+                try:
+                    cursor.execute("""
+                        DELETE FROM user_notifications 
+                        WHERE actor_id = %s AND target_id = %s AND target_type = 'post' AND notification_type = 'like'
+                    """, (user_id, post_id))
+                    conn.commit()
+                except Exception as e:
+                    print(f"[WARN] 删除通知失败: {e}")
         else:
             # 添加点赞
             cursor.execute("""
@@ -1068,19 +1109,31 @@ def toggle_like(post_id):
                 print(f"[WARN] 添加经验值失败: {e}")
             
             # 发送点赞通知（使用独立连接，不影响主事务）
-            try:
-                create_notification(
-                    user_id=post_author_id,
-                    actor_id=user_id,
-                    actor_name=username,
-                    actor_avatar=user_avatar,
-                    notification_type='like',
-                    target_type='post',
-                    target_id=post_id,
-                    target_content=post_content
-                )
-            except Exception as e:
-                print(f"[WARN] 创建通知失败: {e}")
+            # 检查是否已经发送过该通知（防止重复发送）
+            if send_notification:
+                try:
+                    cursor.execute("""
+                        SELECT id FROM user_notifications 
+                        WHERE actor_id = %s AND target_id = %s AND target_type = 'post' AND notification_type = 'like'
+                    """, (user_id, post_id))
+                    existing_notification = cursor.fetchone()
+                    
+                    if not existing_notification:
+                        print(f"[INFO] 发送点赞通知: {username} 点赞了帖子 {post_id}")
+                        create_notification(
+                            user_id=post_author_id,
+                            actor_id=user_id,
+                            actor_name=username,
+                            actor_avatar=user_avatar,
+                            notification_type='like',
+                            target_type='post',
+                            target_id=post_id,
+                            target_content=post_content
+                        )
+                    else:
+                        print(f"[INFO] 点赞通知已存在，跳过")
+                except Exception as e:
+                    print(f"[WARN] 创建点赞通知失败: {e}")
         
         # 获取最新点赞数
         cursor.execute("SELECT likes_count FROM posts WHERE id = %s", (post_id,))
@@ -1121,6 +1174,12 @@ def toggle_favorite(post_id):
         post_author_id = post['user_id']
         post_content = (post['content'] or '')[:50] if post['content'] else '帖子'
         
+        # 不给自己收藏时不发送通知
+        if str(post_author_id) == str(user_id):
+            send_notification = False
+        else:
+            send_notification = True
+        
         # 检查是否已收藏
         cursor.execute("""
             SELECT id FROM post_favorites WHERE post_id = %s AND user_id = %s
@@ -1137,6 +1196,17 @@ def toggle_favorite(post_id):
             """, (post_id,))
             conn.commit()
             favorited = False
+            
+            # 取消收藏时删除之前的通知
+            if send_notification:
+                try:
+                    cursor.execute("""
+                        DELETE FROM user_notifications 
+                        WHERE actor_id = %s AND target_id = %s AND target_type = 'post' AND notification_type = 'favorite'
+                    """, (user_id, post_id))
+                    conn.commit()
+                except Exception as e:
+                    print(f"[WARN] 删除通知失败: {e}")
         else:
             # 添加收藏
             cursor.execute("""
@@ -1151,17 +1221,31 @@ def toggle_favorite(post_id):
             # 添加经验值：收藏+2
             add_experience(user_id, 'like', '收藏帖子')
             
-            # 发送收藏通知
-            create_notification(
-                user_id=post_author_id,
-                actor_id=user_id,
-                actor_name=username,
-                actor_avatar=user_avatar,
-                notification_type='like',
-                target_type='post',
-                target_id=post_id,
-                target_content=post_content
-            )
+            # 发送收藏通知（使用正确的通知类型）
+            if send_notification:
+                try:
+                    cursor.execute("""
+                        SELECT id FROM user_notifications 
+                        WHERE actor_id = %s AND target_id = %s AND target_type = 'post' AND notification_type = 'favorite'
+                    """, (user_id, post_id))
+                    existing_notification = cursor.fetchone()
+                    
+                    if not existing_notification:
+                        print(f"[INFO] 发送收藏通知: {username} 收藏了帖子 {post_id}")
+                        create_notification(
+                            user_id=post_author_id,
+                            actor_id=user_id,
+                            actor_name=username,
+                            actor_avatar=user_avatar,
+                            notification_type='favorite',
+                            target_type='post',
+                            target_id=post_id,
+                            target_content=post_content
+                        )
+                    else:
+                        print(f"[INFO] 收藏通知已存在，跳过")
+                except Exception as e:
+                    print(f"[WARN] 创建收藏通知失败: {e}")
         
         # 获取最新收藏数
         cursor.execute("SELECT favorites_count FROM posts WHERE id = %s", (post_id,))
