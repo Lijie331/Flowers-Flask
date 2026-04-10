@@ -1003,24 +1003,30 @@ def toggle_like(post_id):
             conn.commit()
             liked = True
             
-            # 添加经验值：点赞+1
-            add_experience(user_id, 'like', '点赞帖子')
+            # 添加经验值：点赞+1（使用独立连接，不影响主事务）
+            try:
+                add_experience(user_id, 'like', '点赞帖子')
+            except Exception as e:
+                print(f"[WARN] 添加经验值失败: {e}")
             
-            # 发送点赞通知
-            create_notification(
-                user_id=post_author_id,
-                actor_id=user_id,
-                actor_name=username,
-                actor_avatar=user_avatar,
-                notification_type='like',
-                target_type='post',
-                target_id=post_id,
-                target_content=post_content
-            )
+            # 发送点赞通知（使用独立连接，不影响主事务）
+            try:
+                create_notification(
+                    user_id=post_author_id,
+                    actor_id=user_id,
+                    actor_name=username,
+                    actor_avatar=user_avatar,
+                    notification_type='like',
+                    target_type='post',
+                    target_id=post_id,
+                    target_content=post_content
+                )
+            except Exception as e:
+                print(f"[WARN] 创建通知失败: {e}")
         
         # 获取最新点赞数
         cursor.execute("SELECT likes_count FROM posts WHERE id = %s", (post_id,))
-        likes_count = cursor.fetchone()[0]
+        likes_count = cursor.fetchone()['likes_count']
         
         return jsonify({
             'success': True,

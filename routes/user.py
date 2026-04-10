@@ -36,18 +36,19 @@ def get_db_connection():
 
 def add_experience(user_id, action_type, description=''):
     """添加经验值"""
+    exp_value = EXP_CONFIG.get(action_type, 0)
+    if exp_value == 0:
+        return
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        exp_value = EXP_CONFIG.get(action_type, 0)
-        if exp_value == 0:
-            return
-        
         cursor.execute("""
             INSERT INTO experience_logs (user_id, action_type, exp_value, description)
             VALUES (%s, %s, %s, %s)
         """, (user_id, action_type, exp_value, description))
         
+        # 使用 IGNORE 确保即使user_profiles表不存在对应记录也不会报错
         cursor.execute("""
             UPDATE user_profiles 
             SET experience = experience + %s
@@ -55,7 +56,8 @@ def add_experience(user_id, action_type, description=''):
         """, (exp_value, user_id))
         
         conn.commit()
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] 添加经验值失败: {e}")
         conn.rollback()
     finally:
         cursor.close()
