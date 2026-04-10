@@ -146,6 +146,10 @@ def token_required(f):
     """验证token的装饰器"""
     @wraps(f)
     def decorated(*args, **kwargs):
+        # 处理 OPTIONS 预检请求
+        if request.method == 'OPTIONS':
+            return '', 200
+        
         token = request.headers.get('Authorization', '').replace('Bearer ', '')
         
         if not token:

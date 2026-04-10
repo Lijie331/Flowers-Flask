@@ -13,7 +13,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from flask import Flask
+from flask import Flask, jsonify, g
 from flask_cors import CORS
 
 # 导入配置
@@ -22,6 +22,8 @@ from config import FLASK_CONFIG
 # 导入路由注册函数
 from routes import register_routes
 
+import traceback
+
 # 创建Flask应用
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 CORS(app)
@@ -29,6 +31,19 @@ CORS(app)
 # 注册所有路由
 register_routes(app)
 
+# 配置 CORS
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:5173", "http://127.0.0.1:5173"],
+        "supports_credentials": True
+    }
+})
+
+# 全局错误处理
+@app.errorhandler(Exception)
+def handle_error(e):
+    print(traceback.format_exc())
+    return jsonify({'success': False, 'error': str(e)}), 500
 
 # ============== 启动信息 ==============
 

@@ -7,6 +7,7 @@ import uuid
 import datetime
 from flask import Blueprint, request, jsonify
 import pymysql
+
 from pymysql.cursors import DictCursor
 
 from config import DB_CONFIG
@@ -63,15 +64,20 @@ def add_experience(user_id, action_type, description=''):
 
 @bp.route('/profile', methods=['GET'])
 @token_required
+# 出错了 我不知道后面的函数有没有错，但是这个报错了
 def get_my_profile():
     """获取我的资料"""
     from flask import g
+    from datetime import date, timedelta  # 明确导入
+    
     user_id = g.user_id
+    today = date.today()  # 使用 date 而不是 datetime.date
     
     conn = get_db_connection()
     cursor = conn.cursor(DictCursor)
     
     try:
+        # 1. 查询用户资料（统一字段）
         cursor.execute("""
             SELECT p.*, u.username, u.email, u.is_admin
             FROM user_profiles p
@@ -80,12 +86,16 @@ def get_my_profile():
         """, (user_id,))
         profile = cursor.fetchone()
         
+        # 2. 如果没有资料，创建默认资料
         if not profile:
+            default_nickname = f"FlowerUser{user_id}"
             cursor.execute("""
-                INSERT INTO user_profiles (user_id, nickname) VALUES (%s, %s)
-            """, (user_id, f"FlowerUser{user_id}"))
+                INSERT INTO user_profiles (user_id, nickname, created_at) 
+                VALUES (%s, %s, NOW())
+            """, (user_id, default_nickname))
             conn.commit()
             
+            # 重新查询（字段要和第一次一致！）
             cursor.execute("""
                 SELECT p.*, u.username, u.email, u.is_admin
                 FROM user_profiles p
@@ -94,42 +104,55 @@ def get_my_profile():
             """, (user_id,))
             profile = cursor.fetchone()
         
-        # 更新登录状态和经验
-        today = datetime.date.today()
-        cursor.execute("""
-            SELECT last_login_date, login_streak FROM user_profiles WHERE user_id = %s
-        """, (user_id,))
-        login_info = cursor.fetchone()
-        
-        if login_info:
-            last_login = login_info['last_login_date']
-            if last_login:
-                if last_login == today - datetime.timedelta(days=1):
-                    new_streak = login_info['login_streak'] + 1
-                    cursor.execute("""
-                        UPDATE user_profiles SET login_streak = %s, last_login_date = %s
-                        WHERE user_id = %s
-                    """, (new_streak, today, user_id))
-                elif last_login != today:
-                    cursor.execute("""
-                        UPDATE user_profiles SET login_streak = 1, last_login_date = %s
-                        WHERE user_id = %s
-                    """, (today, user_id))
-            else:
-                cursor.execute("""
-                    UPDATE user_profiles SET login_streak = 1, last_login_date = %s
-WHERE user_id = %s
-                """, (today, user_id))
+        # 3. 处理登录状态和经验（确保 profile 存在）
+        if profile:
+            # 获取当前登录信息
+            cursor.execute("""
+                SELECT last_login_date, login_streak 
+                FROM user_profiles 
+                WHERE user_id = %s
+            """, (user_id,))
+            login_info = cursor.fetchone()
             
-            conn.commit()
-            add_experience(user_id, 'login', '每日登录')
+            if login_info:
+                last_login = login_info.get('last_login_date')
+                current_streak = login_info.get('login_streak', 0) or 0
+                
+                # 确保 last_login 是 date 类型
+                if last_login and hasattr(last_login, 'date'):
+                    last_login = last_login.date()
+                
+                # 计算新的连续登录天数
+                if last_login == today - timedelta(days=1):
+                    new_streak = current_streak + 1
+                elif last_login == today:
+                    new_streak = current_streak  # 今天已经登录过
+                else:
+                    new_streak = 1  # 断签了，重新计算
+                
+                # 更新登录信息
+                cursor.execute("""
+                    UPDATE user_profiles 
+                    SET login_streak = %s, last_login_date = %s
+                    WHERE user_id = %s
+                """, (new_streak, today, user_id))
+                conn.commit()
+                
+                # 只有今天第一次登录才加经验
+                if last_login != today:
+                    add_experience(user_id, 'login', '每日登录')
         
         return jsonify({
             'success': True,
             'data': {'profile': profile}
         })
+        
     except Exception as e:
+        import traceback
+        print(f"Error in get_my_profile: {str(e)}")
+        print(traceback.format_exc())  # 打印完整堆栈到控制台
         return jsonify({'success': False, 'error': str(e)}), 500
+        
     finally:
         cursor.close()
         conn.close()
