@@ -161,6 +161,62 @@ def get_favorites():
         conn.close()
 
 
+@bp.route('/favorites/posts', methods=['GET'])
+@token_required
+def get_favorite_posts():
+    """获取用户收藏的社区帖子列表"""
+    from flask import g
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+    
+    try:
+        cursor.execute("""
+            SELECT p.*, 
+                   1 as is_favorited,
+                   (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes_count,
+                   (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comments_count
+            FROM post_favorites pf
+            JOIN posts p ON pf.post_id = p.id
+            WHERE pf.user_id = %s
+            ORDER BY pf.created_at DESC
+        """, (user_id,))
+        
+        favorites = cursor.fetchall()
+        
+        # 解析 images JSON
+        for post in favorites:
+            if post.get('images'):
+                try:
+                    post['images'] = json.loads(post['images'])
+                except:
+                    post['images'] = []
+            if post.get('topics'):
+                try:
+                    post['topics'] = json.loads(post['topics'])
+                except:
+                    post['topics'] = []
+            if post.get('mentions'):
+                try:
+                    post['mentions'] = json.loads(post['mentions'])
+                except:
+                    post['mentions'] = []
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'favorites': favorites,
+                'total': len(favorites)
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
 @bp.route('/favorites', methods=['POST'])
 @token_required
 def add_favorite():
