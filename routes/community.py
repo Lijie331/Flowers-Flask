@@ -1056,7 +1056,7 @@ def toggle_like(post_id):
             return jsonify({'success': False, 'error': '帖子不存在'}), 404
         
         post_author_id = post['user_id']
-        post_content = (post['content'] or '')[:50] if post['content'] else '帖子'
+        post_content = ((post['content'] or '')[:50]) if post['content'] else '帖子'
         
         # 不给自己点赞时不发送通知
         if str(post_author_id) == str(user_id):
@@ -1172,7 +1172,7 @@ def toggle_favorite(post_id):
             return jsonify({'success': False, 'error': '帖子不存在'}), 404
         
         post_author_id = post['user_id']
-        post_content = (post['content'] or '')[:50] if post['content'] else '帖子'
+        post_content = ((post['content'] or '')[:50]) if post['content'] else '帖子'
         
         # 不给自己收藏时不发送通知
         if str(post_author_id) == str(user_id):
@@ -1320,7 +1320,7 @@ def add_comment(post_id):
             return jsonify({'success': False, 'error': '帖子不存在'}), 404
         
         post_author_id = post['user_id']
-        post_content = (post['content'] or '')[:50] if post['content'] else '帖子'
+        post_content = ((post['content'] or '')[:50]) if post['content'] else '帖子'
         
         cursor.execute("""
             INSERT INTO comments (post_id, user_id, username, user_avatar, content)
