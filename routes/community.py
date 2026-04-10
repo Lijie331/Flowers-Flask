@@ -685,13 +685,15 @@ def get_posts():
         offset = (page - 1) * page_size
         cursor.execute(f"""
             SELECT p.*, 
-                   CASE WHEN l.id IS NOT NULL THEN 1 ELSE 0 END as is_liked
+                   CASE WHEN l.id IS NOT NULL THEN 1 ELSE 0 END as is_liked,
+                   CASE WHEN f.id IS NOT NULL THEN 1 ELSE 0 END as is_favorited
             FROM posts p
             LEFT JOIN likes l ON p.id = l.post_id AND l.user_id = %s
+            LEFT JOIN post_favorites f ON p.id = f.post_id AND f.user_id = %s
             {where}
             ORDER BY p.is_top DESC, p.created_at DESC
             LIMIT %s OFFSET %s
-        """, [request.headers.get('X-User-Id', '')] + params + [page_size, offset])
+        """, [request.headers.get('X-User-Id', '')] + [request.headers.get('X-User-Id', '')] + params + [page_size, offset])
         
         posts = cursor.fetchall()
         
