@@ -81,7 +81,7 @@ def get_my_profile():
     try:
         # 1. 查询用户资料（统一字段）
         cursor.execute("""
-            SELECT p.*, u.username, u.email, u.is_admin
+            SELECT p.*, u.username, u.is_admin
             FROM user_profiles p
             JOIN users u ON p.user_id = u.id
             WHERE p.user_id = %s
@@ -99,7 +99,7 @@ def get_my_profile():
             
             # 重新查询（字段要和第一次一致！）
             cursor.execute("""
-                SELECT p.*, u.username, u.email, u.is_admin
+                SELECT p.*, u.username, u.is_admin
                 FROM user_profiles p
                 JOIN users u ON p.user_id = u.id
                 WHERE p.user_id = %s
@@ -163,7 +163,7 @@ def get_my_profile():
 @bp.route('/profile', methods=['PUT'])
 @token_required
 def update_profile():
-    """更新个人资料"""
+    """更新个人资料 - 只更新user_profiles表，username保持不变"""
     from flask import g
     user_id = g.user_id
     data = request.get_json()
@@ -172,25 +172,40 @@ def update_profile():
     cursor = conn.cursor()
     
     try:
-        updates = []
-        params = []
+        # 检查记录是否存在
+        cursor.execute("SELECT user_id FROM user_profiles WHERE user_id = %s", (user_id,))
+        if not cursor.fetchone():
+            # 如果记录不存在，先创建（nickname默认值为FlowerUser开头）
+            default_nickname = f"FlowerUser{user_id}"
+            cursor.execute("""
+                INSERT INTO user_profiles (user_id, nickname, created_at)
+                VALUES (%s, %s, NOW())
+            """, (user_id, default_nickname))
+        
+        # 更新 user_profiles 表（不涉及users表）
+        profile_updates = []
+        profile_params = []
         
         for field in ['nickname', 'bio', 'gender', 'birthday', 'location', 'garden_visibility']:
-            if field in data:
-                updates.append(f"{field} = %s")
-                params.append(data[field])
+            if field in data and data[field] is not None:
+                profile_updates.append(f"{field} = %s")
+                profile_params.append(data[field])
         
-        if not updates:
+        if not profile_updates:
             return jsonify({'success': False, 'error': '没有要更新的字段'}), 400
         
-        params.append(user_id)
+        profile_params.append(user_id)
         cursor.execute(f"""
-            UPDATE user_profiles SET {', '.join(updates)} WHERE user_id = %s
-        """, params)
+            UPDATE user_profiles SET {', '.join(profile_updates)} WHERE user_id = %s
+        """, profile_params)
+        
         conn.commit()
         
         return jsonify({'success': True, 'message': '资料更新成功'})
     except Exception as e:
+        import traceback
+        print(f"更新资料失败: {str(e)}")
+        print(traceback.format_exc())
         conn.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
@@ -216,6 +231,21 @@ def upload_avatar():
     if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
         ext = '.jpg'
     
+    # 先获取旧头像路径，稍后删除
+    old_avatar_url = None
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT avatar_url FROM user_profiles WHERE user_id = %s", (user_id,))
+        result = cursor.fetchone()
+        if result:
+            old_avatar_url = result[0]
+    except:
+        pass
+    cursor.close()
+    conn.close()
+    
+    # 生成新文件名（只保留最新头像）
     filename = f"{user_id}_{uuid.uuid4().hex[:8]}{ext}"
     filepath = os.path.join(AVATAR_DIR, filename)
     file.save(filepath)
@@ -225,10 +255,23 @@ def upload_avatar():
     cursor = conn.cursor()
     
     try:
+        # 同时更新 users 和 user_profiles 两个表
         cursor.execute("""
             UPDATE user_profiles SET avatar_url = %s WHERE user_id = %s
         """, (avatar_url, user_id))
+        cursor.execute("""
+            UPDATE users SET avatar_url = %s WHERE id = %s
+        """, (avatar_url, user_id))
         conn.commit()
+        
+        # 删除旧头像文件（如果存在且不是默认头像）
+        if old_avatar_url and old_avatar_url.startswith('/static/avatars/'):
+            old_filepath = os.path.join(os.path.dirname(os.path.dirname(__file__)), old_avatar_url.lstrip('/'))
+            if os.path.exists(old_filepath):
+                try:
+                    os.remove(old_filepath)
+                except Exception as e:
+                    print(f"删除旧头像失败: {e}")
         
         return jsonify({
             'success': True,

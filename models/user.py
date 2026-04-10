@@ -126,11 +126,19 @@ def register_user(username: str, password: str, phone: str, avatar_url: str = No
         password_hash = hash_password(password, salt)
         phone_encrypted = encrypt_phone(phone)
         
+        # 插入 users 表
         sql = """
         INSERT INTO users (id, username, password_salt, password_hash, phone, phone_encrypted, avatar_url)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute(sql, (user_id, username, salt, password_hash, phone, phone_encrypted, avatar_url))
+        
+        # 同时插入 user_profiles 表，nickname初始化为username（之后可独立修改）
+        cursor.execute("""
+            INSERT INTO user_profiles (user_id, nickname, avatar_url, created_at)
+            VALUES (%s, %s, %s, NOW())
+        """, (user_id, username, avatar_url))
+        
         conn.commit()
         
         return {
@@ -176,6 +184,11 @@ def login_user(username: str, password: str) -> dict:
         cursor.execute("UPDATE users SET last_login = NOW() WHERE id = %s", (user['id'],))
         conn.commit()
         
+        # 从user_profiles获取nickname
+        cursor.execute("SELECT nickname FROM user_profiles WHERE user_id = %s", (user['id'],))
+        profile = cursor.fetchone()
+        nickname = profile['nickname'] if profile and profile['nickname'] else f"FlowerUser{user['id']}"
+        
         import time
         token = hashlib.sha256(f"{user['id']}{user['username']}{time.time()}".encode()).hexdigest()
         
@@ -185,9 +198,10 @@ def login_user(username: str, password: str) -> dict:
             'success': True,
             'message': '登录成功',
             'token': token,
-'user': {
+            'user': {
                 'id': user['id'],
                 'username': user['username'],
+                'nickname': nickname,
                 'phone': phone_display,
                 'avatar_url': user['avatar_url'],
                 'is_admin': user['is_admin']
@@ -256,15 +270,18 @@ def get_user_by_id(user_id: str) -> dict:
 
 
 def update_avatar(user_id: str, avatar_url: str) -> dict:
-    """更新用户头像"""
+    """更新用户头像 - 同时更新users和user_profiles两个表"""
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
+        # 同时更新 users 和 user_profiles 两个表
         cursor.execute("UPDATE users SET avatar_url = %s WHERE id = %s", (avatar_url, user_id))
+        cursor.execute("UPDATE user_profiles SET avatar_url = %s WHERE user_id = %s", (avatar_url, user_id))
         conn.commit()
         return {'success': True, 'message': '头像更新成功'}
     except Exception as e:
+        conn.rollback()
         return {'success': False, 'message': str(e)}
     finally:
         cursor.close()
