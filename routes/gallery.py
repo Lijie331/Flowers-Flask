@@ -4,13 +4,64 @@
 
 import os
 import urllib.parse
-from flask import Blueprint, jsonify, send_file
+from flask import Blueprint, jsonify, send_file, request, g
 import pymysql
 from pymysql.cursors import DictCursor
 
 from config import IMAGE_BASE_URL, DB_CONFIG
 
 bp = Blueprint('gallery', __name__, url_prefix='/api/gallery')
+
+# 导入认证装饰器
+from routes.auth import token_required
+
+
+# ============== 数据库辅助函数 ==============
+
+def get_db_connection():
+    """获取数据库连接"""
+    return pymysql.connect(**DB_CONFIG)
+
+
+# ============== 图库收藏表初始化 ==============
+
+def init_gallery_favorites_table():
+    """初始化图库收藏表"""
+    conn = get_db_connection()
+    if conn is None:
+        return False
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS gallery_favorites (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id VARCHAR(8) NOT NULL,
+                flower_id INT NOT NULL DEFAULT 0,
+                folder_name VARCHAR(200) NOT NULL,
+                chinese_name VARCHAR(200) DEFAULT '',
+                latin_name VARCHAR(200) DEFAULT '',
+                sample_image VARCHAR(500) DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uk_user_folder (user_id, folder_name),
+                INDEX idx_user_id (user_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='图库收藏表'
+        """)
+        conn.commit()
+        print("[INFO] 图库收藏表初始化完成")
+        return True
+    except Exception as e:
+        print(f"[ERROR] 图库收藏表初始化失败: {e}")
+        conn.rollback()
+        return False
+    finally:
+        cursor.close()
+        conn.close()
+
+# 模块加载时初始化表
+try:
+    init_gallery_favorites_table()
+except:
+    pass
 
 # 内存缓存：从数据库加载的花卉映射
 _FOLDER_CACHE = None
@@ -327,3 +378,153 @@ def search_gallery():
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============== 图库收藏API ==============
+
+@bp.route('/favorites', methods=['GET'])
+@token_required
+def get_gallery_favorites():
+    """获取用户的图库收藏列表"""
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    if conn is None:
+        return jsonify({'success': False, 'error': '数据库连接失败'}), 500
+    
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT id, flower_id, folder_name, chinese_name, latin_name, 
+                   sample_image, created_at
+            FROM gallery_favorites
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        """, (user_id,))
+        
+        favorites = []
+        for row in cursor.fetchall():
+            favorites.append({
+                'id': row[0],
+                'flower_id': row[1],
+                'folder_name': row[2],
+                'chinese_name': row[3],
+                'latin_name': row[4],
+                'sample_image': row[5],
+                'created_at': row[6].isoformat() if row[6] else None
+            })
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'favorites': favorites,
+                'total': len(favorites)
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/favorites', methods=['POST'])
+@token_required
+def add_gallery_favorite():
+    """添加图库收藏"""
+    user_id = g.user_id
+    data = request.get_json()
+    
+    folder_name = data.get('folder_name')
+    flower_id = data.get('flower_id', 0)
+    chinese_name = data.get('chinese_name', '')
+    latin_name = data.get('latin_name', '')
+    sample_image = data.get('sample_image', '')
+    
+    if not folder_name:
+        return jsonify({'success': False, 'error': '缺少文件夹名称'}), 400
+    
+    conn = get_db_connection()
+    if conn is None:
+        return jsonify({'success': False, 'error': '数据库连接失败'}), 500
+    
+    cursor = conn.cursor()
+    try:
+        # 检查是否已收藏
+        cursor.execute("""
+            SELECT id FROM gallery_favorites WHERE user_id = %s AND folder_name = %s
+        """, (user_id, folder_name))
+        if cursor.fetchone():
+            return jsonify({'success': False, 'error': '已收藏过该图库'}), 400
+        
+        # 添加收藏
+        cursor.execute("""
+            INSERT INTO gallery_favorites 
+            (user_id, flower_id, folder_name, chinese_name, latin_name, sample_image)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (user_id, flower_id, folder_name, chinese_name, latin_name, sample_image))
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '收藏成功'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/favorites/<int:favorite_id>', methods=['DELETE'])
+@token_required
+def remove_gallery_favorite(favorite_id):
+    """取消图库收藏"""
+    user_id = g.user_id
+    
+    conn = get_db_connection()
+    if conn is None:
+        return jsonify({'success': False, 'error': '数据库连接失败'}), 500
+    
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            DELETE FROM gallery_favorites WHERE id = %s AND user_id = %s
+        """, (favorite_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({'success': False, 'error': '收藏不存在'}), 404
+        
+        return jsonify({'success': True, 'message': '已取消收藏'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/favorites/check', methods=['GET'])
+@token_required
+def check_gallery_favorite():
+    """检查是否已收藏"""
+    user_id = g.user_id
+    folder_name = request.args.get('folder_name', '')
+    
+    if not folder_name:
+        return jsonify({'success': False, 'error': '缺少文件夹名称'}), 400
+    
+    conn = get_db_connection()
+    if conn is None:
+        return jsonify({'success': False, 'error': '数据库连接失败'}), 500
+    
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT id FROM gallery_favorites WHERE user_id = %s AND folder_name = %s
+        """, (user_id, folder_name))
+        
+        exists = cursor.fetchone() is not None
+        
+        return jsonify({'success': True, 'is_favorited': exists})
+    finally:
+        cursor.close()
+        conn.close()
