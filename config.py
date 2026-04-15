@@ -11,15 +11,8 @@ FLOWER_CLASSES_FILE = os.path.join(DATA_ROOT, 'flowers_data_120.json')
 
 CLIP_CACHE_DIR = r'D:\1B.毕业设计\CLIP_cache'
 
-# 图片数据集路径
+# 图片数据集路径（所有花卉图片已合并到此目录）
 IMAGE_BASE_URL = os.path.join(DATA_ROOT, 'ChineseFlowers120')
-OXFORD_FLOWERS_URL = os.path.join(DATA_ROOT, 'flowers_102')
-
-# 所有图片目录（按优先级排序）
-IMAGE_DIRECTORIES = [
-    OXFORD_FLOWERS_URL,  # Oxford花卉优先（新增数据）
-    IMAGE_BASE_URL,       # 中文花卉120
-]
 
 # 模型路径
 CHECKPOINT_PATH = os.path.join(

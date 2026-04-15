@@ -125,20 +125,22 @@ def get_folder_by_name(search_name):
     if search_name in _FOLDER_TO_INFO:
         return search_name
     
-    # 2. 遍历查找匹配
+    # 2. 遍历查找匹配（优先返回folder_mapping，如果存在的话）
     search_lower = search_name.lower()
     for info in _FOLDER_TO_INFO.values():
         if (search_lower == info['chinese_name'].lower() or 
             search_lower == info['latin_name'].lower() or
             search_lower == info['folder_name'].lower()):
-            return info['folder_name']
+            # 优先返回folder_mapping（实际目录名），否则返回folder_name
+            return info.get('folder_mapping') or info['folder_name']
     
     # 3. 模糊匹配
     for info in _FOLDER_TO_INFO.values():
         if (search_lower in info['chinese_name'].lower() or 
             search_lower in info['latin_name'].lower() or
             search_lower in info['folder_name'].lower()):
-            return info['folder_name']
+            # 优先返回folder_mapping（实际目录名），否则返回folder_name
+            return info.get('folder_mapping') or info['folder_name']
     
     # 4. 都找不到，返回原名称
     return search_name
@@ -148,52 +150,70 @@ def get_folder_by_name(search_name):
 
 @bp.route('/flowers', methods=['GET'])
 def get_gallery_flowers():
-    """获取所有花卉图库列表"""
+    """获取所有花卉图库列表 - 直接从flowers表读取image_url"""
     try:
-        # 确保加载映射
-        load_flower_mapping()
-        
+        conn = get_db_connection()
+        cursor = conn.cursor(DictCursor)
+
+        # 直接从flowers表获取所有花卉
+        cursor.execute("""
+            SELECT id, chinese_name, latin_name, family, genus, image_url 
+            FROM flowers 
+            WHERE image_url IS NOT NULL AND image_url != '' AND image_url != '[]'
+            ORDER BY chinese_name
+        """)
+
+        import json
         flowers = []
-        
-        for folder_name in os.listdir(IMAGE_BASE_URL):
-            folder_path = os.path.join(IMAGE_BASE_URL, folder_name)
-            if os.path.isdir(folder_path):
-                image_files = [f for f in os.listdir(folder_path) 
-                              if f.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp'))]
-                
-                if not image_files:
-                    continue
-                
-                sample_image = f'/api/gallery/images/{folder_name}/{image_files[0]}'
-                
-                # 从数据库获取花卉信息
-                flower_info = get_flower_info_by_folder(folder_name)
-                
-                if flower_info:
-                    flowers.append({
-                        'id': flower_info['id'],
-                        'name': folder_name,  # 文件夹名
-                        'name_en': flower_info['latin_name'],  # 拉丁名
-                        'name_cn': flower_info['chinese_name'],  # 中文名
-                        'family': flower_info.get('family', ''),
-                        'image_count': len(image_files),
-                        'sample_image': sample_image
-                    })
-                else:
-                    # 找不到映射的文件夹也显示
-                    flowers.append({
-                        'id': 0,
-                        'name': folder_name,
-                        'name_en': folder_name,
-                        'name_cn': folder_name,
-                        'family': '',
-                        'image_count': len(image_files),
-                        'sample_image': sample_image
-                    })
-        
-        # 按中文名排序
-        flowers.sort(key=lambda x: x['name_cn'])
-        
+        for row in cursor.fetchall():
+            image_url = row.get('image_url') or ''
+            
+            # 解析 image_url JSON
+            sample_image = ''
+            image_count = 0
+            images = []
+            
+            if image_url:
+                try:
+                    image_data = json.loads(image_url)
+                    image_count = image_data.get('count', 0)
+                    
+                    if 'images' in image_data:
+                        for img in image_data['images']:
+                            if isinstance(img, dict) and 'relative_path' in img:
+                                rel_path = img['relative_path']
+                                # 使用第一张图片作为封面
+                                if not sample_image:
+                                    sample_image = f'/api/encyclopedia/images/{rel_path}'
+                                images.append(rel_path)
+                            elif isinstance(img, str):
+                                if not sample_image:
+                                    sample_image = f'/api/encyclopedia/images/{img}'
+                                images.append(img)
+                    
+                    # 如果没有count字段，从images列表计算
+                    if image_count == 0 and images:
+                        image_count = len(images)
+                        
+                except json.JSONDecodeError:
+                    pass
+            
+            # 只有有图片的花卉才显示
+            if image_count > 0:
+                flowers.append({
+                    'id': row['id'],
+                    'name': row['chinese_name'],
+                    'name_en': row['latin_name'] or '',
+                    'name_cn': row['chinese_name'],
+                    'family': row['family'] or '',
+                    'genus': row['genus'] or '',
+                    'image_count': image_count,
+                    'sample_image': sample_image
+                })
+
+        cursor.close()
+        conn.close()
+
         return jsonify({
             'success': True,
             'data': {
@@ -209,122 +229,111 @@ def get_gallery_flowers():
 
 @bp.route('/flower/<path:flower_name>', methods=['GET'])
 def get_flower_images(flower_name):
-    """获取指定花卉的所有图片"""
+    """获取指定花卉的所有图片 - 直接从flowers表读取image_url"""
     try:
-        # 确保加载映射
-        load_flower_mapping()
-        
         flower_name = urllib.parse.unquote(flower_name)
         
-        # 从数据库查找文件夹名
-        folder_name = get_folder_by_name(flower_name)
-        folder_path = os.path.join(IMAGE_BASE_URL, folder_name)
+        conn = get_db_connection()
+        cursor = conn.cursor(DictCursor)
         
-        if not os.path.exists(folder_path):
+        # 直接从flowers表查找
+        cursor.execute("""
+            SELECT id, chinese_name, latin_name, family, image_url 
+            FROM flowers 
+            WHERE chinese_name = %s OR latin_name = %s
+        """, (flower_name, flower_name))
+        
+        flower = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if not flower:
             return jsonify({
                 'success': False,
                 'error': f'花卉 "{flower_name}" 不存在'
             }), 404
         
-        image_files = sorted([f for f in os.listdir(folder_path) 
-                             if f.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp'))])
+        # 解析 image_url JSON
+        import json
+        images = []
+        if flower.get('image_url'):
+            try:
+                image_data = json.loads(flower['image_url'])
+                if 'images' in image_data:
+                    for img in image_data['images']:
+                        if isinstance(img, dict) and 'relative_path' in img:
+                            # 直接使用 relative_path 构建URL
+                            images.append({
+                                'id': len(images) + 1,
+                                'filename': img.get('filename', img['relative_path'].split('/')[-1]),
+                                'url': f'/api/encyclopedia/images/{img["relative_path"]}'
+                            })
+                        elif isinstance(img, str):
+                            # 直接是相对路径字符串
+                            images.append({
+                                'id': len(images) + 1,
+                                'filename': img.split('/')[-1],
+                                'url': f'/api/encyclopedia/images/{img}'
+                            })
+            except json.JSONDecodeError:
+                pass
         
-        images = [{
-            'id': i + 1,
-            'filename': filename,
-            'url': f'/api/gallery/images/{folder_name}/{filename}'
-        } for i, filename in enumerate(image_files)]
-        
-        # 获取花卉信息
-        flower_info = get_flower_info_by_folder(folder_name)
-        
-        if flower_info:
-            return jsonify({
-                'success': True,
-                'data': {
-                    'id': flower_info['id'],
-                    'name': folder_name,
-                    'name_en': flower_info['latin_name'],
-                    'name_cn': flower_info['chinese_name'],
-                    'family': flower_info.get('family', ''),
-                    'images': images,
-                    'total': len(images)
-                }
-            })
-        else:
-            return jsonify({
-                'success': True,
-                'data': {
-                    'id': 0,
-                    'name': folder_name,
-                    'name_en': folder_name,
-                    'name_cn': folder_name,
-                    'family': '',
-                    'images': images,
-                    'total': len(images)
-                }
-            })
+        return jsonify({
+            'success': True,
+            'data': {
+                'id': flower['id'],
+                'name': flower['chinese_name'],
+                'name_en': flower['latin_name'] or '',
+                'name_cn': flower['chinese_name'],
+                'family': flower.get('family', ''),
+                'images': images,
+                'total': len(images)
+            }
+        })
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@bp.route('/images/<path:filename>')
-def serve_gallery_image(filename):
-    """提供图库图片访问服务"""
-    try:
-        file_path = os.path.join(IMAGE_BASE_URL, filename)
-        file_path = os.path.normpath(file_path)
-        
-        if not file_path.startswith(os.path.normpath(IMAGE_BASE_URL)):
-            return 'Forbidden', 403
-        
-        if os.path.exists(file_path):
-            ext = os.path.splitext(filename)[1].lower()
-            mime_types = {
-                '.jpg': 'image/jpeg',
-                '.jpeg': 'image/jpeg',
-                '.png': 'image/png',
-                '.gif': 'image/gif',
-                '.webp': 'image/webp'
-            }
-            mime_type = mime_types.get(ext, 'application/octet-stream')
-            return send_file(file_path, mimetype=mime_type)
-        else:
-            return 'Image not found', 404
-    except Exception as e:
-        return str(e), 500
+# encyclopedia.py 中已有 /api/encyclopedia/images/<path> 服务图片，使用那个即可
 
 
 @bp.route('/search', methods=['GET'])
 def search_gallery():
     """搜索花卉图库"""
     from flask import request
-    
+
     try:
         # 确保加载映射
         load_flower_mapping()
-        
+
         keyword = request.args.get('keyword', '').strip()
-        
+
         if not keyword:
             return jsonify({
                 'success': False,
                 'error': '请提供搜索关键词'
             }), 400
-        
+
         results = []
         keyword_lower = keyword.lower()
-        
+
+        # 遍历图片目录
+        if not os.path.exists(IMAGE_BASE_URL):
+            return jsonify({
+                'success': False,
+                'error': '图片目录不存在'
+            }), 500
+
         for folder_name in os.listdir(IMAGE_BASE_URL):
             folder_path = os.path.join(IMAGE_BASE_URL, folder_name)
             if not os.path.isdir(folder_path):
                 continue
-            
+
             # 获取花卉信息
             flower_info = get_flower_info_by_folder(folder_name)
-            
+
             # 匹配逻辑：文件夹名、中文名、拉丁名
             match = False
             if flower_info:
@@ -335,16 +344,16 @@ def search_gallery():
             else:
                 if keyword_lower in folder_name.lower():
                     match = True
-            
+
             if match:
-                image_files = [f for f in os.listdir(folder_path) 
+                image_files = [f for f in os.listdir(folder_path)
                               if f.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp'))]
-                
+
                 if not image_files:
                     continue
-                
-                sample_image = f'/api/gallery/images/{folder_name}/{image_files[0]}'
-                
+
+                sample_image = f'/api/encyclopedia/images/{folder_name}/{image_files[0]}'
+
                 if flower_info:
                     results.append({
                         'id': flower_info['id'],
@@ -364,8 +373,8 @@ def search_gallery():
                         'family': '',
                         'image_count': len(image_files),
                         'sample_image': sample_image
-                    })
-        
+                        })
+
         return jsonify({
             'success': True,
             'data': {
@@ -521,10 +530,13 @@ def check_gallery_favorite():
         cursor.execute("""
             SELECT id FROM gallery_favorites WHERE user_id = %s AND folder_name = %s
         """, (user_id, folder_name))
-        
+
         exists = cursor.fetchone() is not None
-        
+
         return jsonify({'success': True, 'is_favorited': exists})
     finally:
         cursor.close()
         conn.close()
+
+
+# encyclopedia.py 中已有 /api/encyclopedia/images/<path> 服务图库图片，无需重复定义
