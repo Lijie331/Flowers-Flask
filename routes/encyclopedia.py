@@ -6,7 +6,7 @@ import json
 import os
 from flask import Blueprint, request, jsonify, send_file
 
-from config import IMAGE_BASE_URL
+from config import IMAGE_BASE_URL, OXFORD_FLOWERS_URL, IMAGE_DIRECTORIES
 from models import get_db_connection, execute_query
 
 bp = Blueprint('encyclopedia', __name__, url_prefix='/api/encyclopedia')
@@ -266,27 +266,30 @@ def get_categories():
 
 @bp.route('/images/<path:filename>')
 def serve_image(filename):
-    """提供图片访问服务"""
+    """提供图片访问服务 - 支持多个图片目录"""
     try:
-        file_path = os.path.join(IMAGE_BASE_URL, filename)
-        file_path = os.path.normpath(file_path)
+        # 优先在Oxford目录查找，再在中文花卉目录查找
+        for base_dir in IMAGE_DIRECTORIES:
+            file_path = os.path.join(base_dir, filename)
+            file_path = os.path.normpath(file_path)
+            
+            # 安全检查：确保路径在允许的目录内
+            if not file_path.startswith(os.path.normpath(base_dir)):
+                continue
+            
+            if os.path.exists(file_path):
+                ext = os.path.splitext(filename)[1].lower()
+                mime_types = {
+                    '.jpg': 'image/jpeg',
+                    '.jpeg': 'image/jpeg',
+                    '.png': 'image/png',
+                    '.gif': 'image/gif',
+                    '.webp': 'image/webp'
+                }
+                mime_type = mime_types.get(ext, 'application/octet-stream')
+                return send_file(file_path, mimetype=mime_type)
         
-        if not file_path.startswith(os.path.normpath(IMAGE_BASE_URL)):
-            return 'Forbidden', 403
-        
-        if os.path.exists(file_path):
-            ext = os.path.splitext(filename)[1].lower()
-            mime_types = {
-                '.jpg': 'image/jpeg',
-                '.jpeg': 'image/jpeg',
-                '.png': 'image/png',
-                '.gif': 'image/gif',
-                '.webp': 'image/webp'
-            }
-            mime_type = mime_types.get(ext, 'application/octet-stream')
-            return send_file(file_path, mimetype=mime_type)
-        else:
-            return 'Image not found', 404
+        return 'Image not found', 404
     except Exception as e:
         return str(e), 500
 

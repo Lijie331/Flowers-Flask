@@ -116,31 +116,27 @@ transform = None
 
 
 class FlowerClassifier(nn.Module):
-    """花卉分类模型 - 与train_optimized.py训练脚本保存的格式完全匹配"""
+    """花卉分类模型 - 支持LIFT训练脚本保存的CosineClassifier格式"""
     def __init__(self, clip_model, num_classes=120):
         super().__init__()
         self.clip_model = clip_model
         feat_dim = clip_model.visual.output_dim  # 2048 for RN50
         
-        # 与训练脚本 ImprovedClassifier 完全一致的分类头结构
-        self.fc1 = nn.Linear(feat_dim, 512)
-        self.ln1 = nn.LayerNorm(512)
-        self.dropout = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(512, num_classes)
+        # LIFT使用的CosineClassifier结构
+        # weight shape: (num_classes, feat_dim)
+        self.weight = nn.Parameter(torch.empty(num_classes, feat_dim))
+        self.scale = 30.0  # CosineClassifier的默认scale
         
-        # 初始化
-        nn.init.xavier_uniform_(self.fc1.weight)
-        nn.init.zeros_(self.fc1.bias)
+        # 初始化权重
+        self.weight.data.uniform_(-1, 1).renorm_(2, 0, 1e-5).mul_(1e5)
     
     def forward(self, x):
         with torch.no_grad():
             features = self.clip_model.encode_image(x)
-        x = self.fc1(features)
-        x = self.ln1(x)
-        x = F.relu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
+        # CosineClassifier的forward逻辑
+        x = F.normalize(features, dim=-1)
+        weight = F.normalize(self.weight, dim=-1)
+        return F.linear(x, weight) * self.scale
 
 
 def load_model():
@@ -176,7 +172,17 @@ def load_model():
     # 2. 构建分类模型
     print("[INFO] Building classification model...")
     try:
-        num_classes = 120
+        # 从checkpoint中获取实际的类别数
+        if os.path.exists(CHECKPOINT_PATH):
+            checkpoint = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
+            if 'head' in checkpoint and 'weight' in checkpoint['head']:
+                num_classes = checkpoint['head']['weight'].shape[0]
+                print(f"[INFO] Detected {num_classes} classes from checkpoint")
+            else:
+                num_classes = 120
+        else:
+            num_classes = 120
+        
         model = FlowerClassifier(clip_model, num_classes)
         model.to(device)
         model.eval()
@@ -196,23 +202,30 @@ def load_model():
     try:
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
         
-        # 训练脚本保存的格式: classifier_state, clip_state
-        if 'classifier_state' in checkpoint:
-            print("[INFO] Loading classifier weights from classifier_state...")
-            classifier_state = checkpoint['classifier_state']
-            model.load_state_dict(classifier_state, strict=False)
-            print(f"[INFO] Classifier loaded successfully")
+        # LIFT训练脚本保存的格式: tuner, head
+        # head 包含 CosineClassifier 的 weight 和 scale
+        if 'head' in checkpoint:
+            print("[INFO] Loading head weights from checkpoint...")
+            head_state = checkpoint['head']
+            
+            # 构建新的state_dict来匹配FlowerClassifier
+            new_state_dict = {}
+            for k, v in head_state.items():
+                if k.startswith('head.'):
+                    # 移除 'head.' 前缀
+                    new_key = k[5:]
+                else:
+                    new_key = k
+                new_state_dict[new_key] = v
+            
+            # 加载权重
+            model.load_state_dict(new_state_dict, strict=False)
+            print(f"[INFO] Head weights loaded: {list(new_state_dict.keys())}")
         
-        if 'clip_state' in checkpoint:
-            print("[INFO] Loading CLIP weights from clip_state...")
-            clip_state = checkpoint['clip_state']
-            # 移除可能的 'clip_model.' 前缀
-            new_clip_state = {}
-            for k, v in clip_state.items():
-                new_key = k.replace('clip_model.', '')
-                new_clip_state[new_key] = v
-            model.clip_model.load_state_dict(new_clip_state, strict=False)
-            print("[INFO] CLIP weights loaded successfully")
+        # 如果有tuner权重（可能是CLIP微调的参数）
+        if 'tuner' in checkpoint:
+            print("[INFO] Found tuner weights (CLIP fine-tuning)")
+            # LIFT中tuner通常是空的，除非启用full_tuning
         
         print("[INFO] Model loaded successfully!")
         return True
