@@ -66,7 +66,6 @@ def add_experience(user_id, action_type, description=''):
 
 @bp.route('/profile', methods=['GET'])
 @token_required
-# 出错了 我不知道后面的函数有没有错，但是这个报错了
 def get_my_profile():
     """获取我的资料"""
     from flask import g

@@ -45,67 +45,47 @@ def optional_token_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# 从数据库加载花卉类别名称映射
-def load_classes_from_database():
-    """从数据库 flower_mapping 表加载花卉类别"""
+import os
+import json
+
+# 从 flower102_classes.json 加载类别映射
+CLASS_MAPPING = {}  # index -> {en, zh}
+CLASSNAMES = []  # 英文名列表
+CLASSNAMES_CN = []  # 中文名列表
+
+def load_class_mapping():
+    """从 flower102_classes.json 加载模型输出到中英文的映射"""
+    global CLASS_MAPPING, CLASSNAMES, CLASSNAMES_CN
+    
+    json_path = r"D:\1B.毕业设计\102\LIFT-main102\data\flower102_classes.json"
+    
     try:
-        conn = pymysql.connect(**DB_CONFIG)
-        cursor = conn.cursor(DictCursor)
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
         
-        # 按 id 排序确保与模型输出对应
-        cursor.execute("SELECT * FROM flower_mapping ORDER BY id")
-        rows = cursor.fetchall()
+        # classes 是列表，每个元素是 {"id": {"en": "...", "zh": "..."}}
+        for item in data.get('classes', []):
+            if isinstance(item, dict):
+                for cls_id, cls_info in item.items():
+                    idx = int(cls_id) - 1  # id从1开始，转为0-based索引
+                    CLASS_MAPPING[idx] = {
+                        'id': cls_id,
+                        'en': cls_info.get('en', ''),
+                        'zh': cls_info.get('zh', '')
+                    }
         
-        # 按 id 顺序构建列表
-        classes = []
-        id_to_info = {}  # id -> {folderName, latin_name, chinese_name}
+        # 构建英文名和中文名列表（按索引排序）
+        CLASSNAMES = [CLASS_MAPPING[i]['en'] for i in sorted(CLASS_MAPPING.keys())]
+        CLASSNAMES_CN = [CLASS_MAPPING[i]['zh'] for i in sorted(CLASS_MAPPING.keys())]
         
-        for row in rows:
-            folder_name = row['folder_name']
-            latin_name = row['latin_name']
-            chinese_name = row['chinese_name']
-            
-            classes.append(folder_name)
-            id_to_info[row['id']] = {
-                'folder_name': folder_name,
-                'latin_name': latin_name,
-                'chinese_name': chinese_name
-            }
-        
-        cursor.close()
-        conn.close()
-        
-        print(f"[INFO] 从数据库加载了 {len(classes)} 个花卉类别")
-        return classes, id_to_info
-        
+        print(f"[INFO] 从 flower102_classes.json 加载了 {len(CLASSNAMES)} 个类别映射")
+        return True
     except Exception as e:
-        print(f"[ERROR] 从数据库加载类别失败: {e}")
-        # 降级到文件夹方式
-        return load_classes_from_folder(), None
+        print(f"[ERROR] 加载类别映射失败: {e}")
+        return False
 
-
-def load_classes_from_folder():
-    """从数据集目录加载花卉类别（降级方案）"""
-    import os
-    classes = []
-    if os.path.exists(IMAGE_BASE_URL):
-        for folder in sorted(os.listdir(IMAGE_BASE_URL)):
-            folder_path = os.path.join(IMAGE_BASE_URL, folder)
-            if os.path.isdir(folder_path):
-                classes.append(folder)
-    print(f"[INFO] 从数据集文件夹加载了 {len(classes)} 个花卉类别")
-    return classes
-
-
-# 加载类别
-CLASSNAMES, _ID_TO_INFO = load_classes_from_database()
-CLASSNAMES_CN = {name: name for name in CLASSNAMES}
-
-# 如果数据库加载成功，构建 id 到信息的映射
-if _ID_TO_INFO:
-    _ID_TO_CLASS = _ID_TO_INFO
-else:
-    _ID_TO_CLASS = {}
+# 加载类别映射
+load_class_mapping()
 
 bp = Blueprint('identify', __name__, url_prefix='/api')
 
@@ -292,6 +272,7 @@ def classify_flower():
             data = request.get_json()
             top_k = data.get('top_k', 5)
             image_data = data.get('image', '')
+            debug_mode = data.get('debug', False)  # 添加debug参数
             
             if not image_data:
                 return jsonify({'success': False, 'error': 'Missing image data'}), 400
@@ -303,6 +284,7 @@ def classify_flower():
             file = request.files['image']
             top_k = int(request.form.get('top_k', 5))
             image = Image.open(file).convert('RGB')
+            debug_mode = request.form.get('debug', 'false').lower() == 'true'
         
         else:
             return jsonify({'success': False, 'error': 'No image provided'}), 400
@@ -316,30 +298,60 @@ def classify_flower():
             probs = torch.softmax(output, dim=1)
             top_probs, top_indices = torch.topk(probs, min(top_k, len(CLASSNAMES)), dim=1)
         
-        # 构建结果
+        # 如果是debug模式，返回原始模型输出
+        if debug_mode:
+            raw_results = []
+            for prob, idx in zip(top_probs[0], top_indices[0]):
+                class_id = int(idx.item())
+                
+                # 使用 CLASS_MAPPING 获取信息
+                if class_id in CLASS_MAPPING:
+                    mapping = CLASS_MAPPING[class_id]
+                    chinese_name = mapping['zh']
+                    english_name = mapping['en']
+                else:
+                    chinese_name = 'unknown'
+                    english_name = f'class_{class_id}'
+                
+                raw_results.append({
+                    'class_id': class_id,  # 0-based 索引
+                    'class_id_1based': class_id + 1,  # 1-based 索引 (对应 flower102_classes.json)
+                    'chinese_name': chinese_name,
+                    'english_name': english_name,
+                    'valid': class_id < len(CLASS_MAPPING),
+                    'raw_logit': round(output[0][class_id].item(), 4),
+                    'softmax_prob': round(prob.item(), 6)
+                })
+            
+            return jsonify({
+                'success': True,
+                'debug': True,
+                'model_output_classes': 102,
+                'mapping_classes': len(CLASS_MAPPING),
+                'raw_results': raw_results,
+                'model_output_shape': list(output.shape)
+            })
+        
+        # 构建结果（使用 flower102_classes.json 的映射）
         results = []
         for prob, idx in zip(top_probs[0], top_indices[0]):
             class_id = int(idx.item())
-            if class_id >= len(CLASSNAMES):
-                continue
             
-            english_name = CLASSNAMES[class_id]
-            
-            # 优先使用数据库中的信息
-            if _ID_TO_CLASS and (class_id + 1) in _ID_TO_CLASS:
-                info = _ID_TO_CLASS[class_id + 1]
-                latin_name = info['latin_name']
-                chinese_name = info['chinese_name']
+            # 使用 CLASS_MAPPING 获取中英文名称
+            if class_id in CLASS_MAPPING:
+                mapping = CLASS_MAPPING[class_id]
+                english_name = mapping['en']
+                chinese_name = mapping['zh']
             else:
-                latin_name = english_name
-                chinese_name = english_name
+                english_name = f"class_{class_id}"
+                chinese_name = f"类别_{class_id}"
             
             results.append({
-                'class_id': class_id,
-                'name': english_name,
-                'name_en': latin_name,
+                'class_id': class_id,  # 模型输出的原始索引 (0-based)
+                'class_id_1based': class_id + 1,  # 1-based 索引 (对应 flower102_classes.json)
+                'name_en': english_name,
                 'name_cn': chinese_name,
-                'display_name': f"{chinese_name} ({latin_name})",
+                'display_name': f"{chinese_name} ({english_name})",
                 'confidence': round(prob.item() * 100, 2)
             })
         
@@ -370,27 +382,20 @@ def classify_flower():
 def get_classes():
     """获取所有花卉类别"""
     classes = []
-    for i, name in enumerate(CLASSNAMES):
-        if _ID_TO_CLASS and (i + 1) in _ID_TO_CLASS:
-            info = _ID_TO_CLASS[i + 1]
-            classes.append({
-                'id': i,
-                'name': info['folder_name'],
-                'name_en': info['latin_name'],
-                'name_cn': info['chinese_name']
-            })
-        else:
-            classes.append({
-                'id': i,
-                'name': name,
-                'name_en': name,
-                'name_cn': name
-            })
+    for idx in sorted(CLASS_MAPPING.keys()):
+        mapping = CLASS_MAPPING[idx]
+        classes.append({
+            'id': idx,
+            'id_1based': idx + 1,
+            'name_en': mapping['en'],
+            'name_cn': mapping['zh'],
+            'display_name': f"{mapping['zh']} ({mapping['en']})"
+        })
     
     return jsonify({
         'success': True,
         'classes': classes,
-        'total': len(CLASSNAMES)
+        'total': len(classes)
     })
 
 

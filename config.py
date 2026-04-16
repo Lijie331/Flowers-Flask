@@ -18,7 +18,7 @@ IMAGE_BASE_URL = os.path.join(DATA_ROOT, 'ChineseFlowers120')
 CHECKPOINT_PATH = os.path.join(
     PROJECT_ROOT, 
     'output', 
-    'best_model.pth',
+    'best_model.pth.tar',  # 使用LIFT训练输出的模型文件
 )
 
 # ============== 数据库配置 ==============

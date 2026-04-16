@@ -69,7 +69,7 @@ _FOLDER_TO_INFO = {}  # folder_name -> {id, latin_name, chinese_name, folder_nam
 
 
 def load_flower_mapping():
-    """从数据库加载花卉文件夹映射到内存"""
+    """从数据库 flowers_2 表加载花卉文件夹映射到内存"""
     global _FOLDER_CACHE, _FOLDER_TO_INFO
     
     if _FOLDER_CACHE is not None:
@@ -79,28 +79,33 @@ def load_flower_mapping():
         conn = pymysql.connect(**DB_CONFIG)
         cursor = conn.cursor(DictCursor)
         
-        cursor.execute("SELECT * FROM flower_mapping ORDER BY id")
+        # 直接从 flowers_2 表加载
+        cursor.execute("SELECT id, chinese_name, latin_name, family, genus FROM flowers ORDER BY id")
         rows = cursor.fetchall()
         
         _FOLDER_CACHE = {}
         _FOLDER_TO_INFO = {}
         
         for row in rows:
-            folder_name = row['folder_name']
-            _FOLDER_CACHE[folder_name] = {
+            chinese_name = row['chinese_name']
+            _FOLDER_CACHE[chinese_name] = {
                 'id': row['id'],
                 'latin_name': row['latin_name'],
                 'chinese_name': row['chinese_name'],
-                'folder_name': folder_name,
+                'folder_name': row['chinese_name'],
                 'family': row.get('family', ''),
                 'genus': row.get('genus', '')
             }
-            _FOLDER_TO_INFO[folder_name] = _FOLDER_CACHE[folder_name]
+            _FOLDER_TO_INFO[chinese_name] = _FOLDER_CACHE[chinese_name]
+            
+            # 也用 latin_name 作为 key
+            if row['latin_name']:
+                _FOLDER_TO_INFO[row['latin_name']] = _FOLDER_CACHE[chinese_name]
         
         cursor.close()
         conn.close()
         
-        print(f"[INFO] 图库模块加载了 {len(_FOLDER_CACHE)} 个花卉文件夹映射")
+        print(f"[INFO] 图库模块加载了 {len(_FOLDER_CACHE)} 个花卉映射 (来自flowers_2表)")
         return _FOLDER_CACHE
         
     except Exception as e:
@@ -155,7 +160,7 @@ def get_gallery_flowers():
         conn = get_db_connection()
         cursor = conn.cursor(DictCursor)
 
-        # 直接从flowers表获取所有花卉
+        # 直接从flowers_2表获取所有花卉
         cursor.execute("""
             SELECT id, chinese_name, latin_name, family, genus, image_url 
             FROM flowers 
@@ -236,7 +241,7 @@ def get_flower_images(flower_name):
         conn = get_db_connection()
         cursor = conn.cursor(DictCursor)
         
-        # 直接从flowers表查找
+        # 直接从flowers_2表查找
         cursor.execute("""
             SELECT id, chinese_name, latin_name, family, image_url 
             FROM flowers 
