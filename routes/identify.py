@@ -66,18 +66,14 @@ def optional_token_required(f):
         if auth_header.startswith('Bearer '):
             token = auth_header[7:]
             try:
-                import jwt
-                from config import JWT_CONFIG
-                payload = jwt.decode(token, JWT_CONFIG['secret_key'], algorithms=['HS256'])
-                g.user_id = payload.get('user_id')
-                # 获取用户信息
-                conn = pymysql.connect(**DB_CONFIG)
-                cursor = conn.cursor(pymysql.cursors.DictCursor)
-                cursor.execute("SELECT * FROM users WHERE id = %s", (g.user_id,))
-                g.user = cursor.fetchone()
-                cursor.close()
-                conn.close()
-            except:
+                # 从数据库验证token（与auth.py一致）
+                from routes.auth import get_user_id_by_token, get_user_by_id
+                user_id = get_user_id_by_token(token)
+                if user_id:
+                    g.user_id = user_id
+                    g.user = get_user_by_id(user_id)
+            except Exception as e:
+                print(f"[WARN] Token验证失败: {e}")
                 pass
         return f(*args, **kwargs)
     return decorated
@@ -440,12 +436,13 @@ def classify_flower():
     trans = get_transform()
     
     try:
-        # 获取图片
+        # 获取图片和原始数据
+        image_data = ''  # 用于保存历史记录
         if request.is_json:
             data = request.get_json()
             top_k = data.get('top_k', 5)
             image_data = data.get('image', '')
-            debug_mode = data.get('debug', False)  # 添加debug参数
+            debug_mode = data.get('debug', False)
             
             if not image_data:
                 return jsonify({'success': False, 'error': 'Missing image data'}), 400
@@ -458,6 +455,8 @@ def classify_flower():
             top_k = int(request.form.get('top_k', 5))
             image = Image.open(file).convert('RGB')
             debug_mode = request.form.get('debug', 'false').lower() == 'true'
+            # 对于文件上传，暂时不支持保存图片
+            image_data = ''
         
         else:
             return jsonify({'success': False, 'error': 'No image provided'}), 400
@@ -535,6 +534,46 @@ def classify_flower():
                 add_experience(g.user_id, 'identify', '识别花卉')
             except:
                 pass
+        print(f"[DEBUG] g.user_id = {g.user_id}")
+        # 保存识别历史记录（仅保存已登录用户的记录）
+        if g.user_id and results and len(results) > 0:
+            try:
+                top_result = results[0]
+                
+                # 准备top_results JSON数据
+                top_results_json = json.dumps(results[:5], ensure_ascii=False)
+                
+                # 保存到数据库（置信度存为0-1的小数，图片存为base64）
+                print(f"[DEBUG] 开始保存历史记录...")
+                print(f"[DEBUG] user_id: {g.user_id}")
+                print(f"[DEBUG] image_data长度: {len(image_data) if image_data else 0}")
+                
+                conn = pymysql.connect(**DB_CONFIG)
+                cursor = conn.cursor()
+                sql = """
+                INSERT INTO identify_history 
+                (user_id, image_url, model_name, predicted_class_id, predicted_class_name, 
+                 predicted_class_en, confidence, top_results)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                cursor.execute(sql, (
+                    g.user_id,  # 用户ID
+                    image_data[:30000] if len(image_data) > 30000 else image_data,  # 图片base64（限制30KB）
+                    current_model_name,  # 模型名称
+                    top_result['class_id'],  # 预测类别ID
+                    top_result['name_cn'],  # 中文名
+                    top_result['name_en'],  # 英文名
+                    top_result['confidence'] / 100.0,  # 置信度转为0-1
+                    top_results_json  # JSON格式的top结果
+                ))
+                conn.commit()
+                cursor.close()
+                conn.close()
+                print(f"[INFO] 识别历史已保存: {top_result['name_cn']} ({top_result['confidence']}%)")
+            except Exception as e:
+                import traceback
+                print(f"[ERROR] 保存识别历史失败: {e}")
+                print(f"[ERROR] 详细错误: {traceback.format_exc()}")
         
         return jsonify({
             'success': True,
@@ -570,6 +609,76 @@ def get_classes():
         'classes': classes,
         'total': len(classes)
     })
+
+
+@bp.route('/identify/history', methods=['GET'])
+@optional_token_required
+def get_identify_history():
+    """获取用户的识别历史记录（最近20条）"""
+    from flask import g
+    
+    user_id = g.user_id
+    
+    # 如果未登录，返回空列表
+    if not user_id:
+        return jsonify({
+            'success': True,
+            'history': [],
+            'total': 0,
+            'message': '未登录用户无历史记录'
+        })
+    
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        sql = """
+        SELECT id, model_name, predicted_class_id, predicted_class_name, 
+               predicted_class_en, confidence, top_results, image_url, created_at
+        FROM identify_history
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT 20
+        """
+        cursor.execute(sql, (user_id,))
+        records = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        # 转换置信度为百分比格式
+        history = []
+        for record in records:
+            top_results = record['top_results']
+            if isinstance(top_results, str):
+                top_results = json.loads(top_results)
+            
+            history.append({
+                'id': record['id'],
+                'model_name': record['model_name'],
+                'model_display': MODEL_REGISTRY.get(record['model_name'], {}).get('display_name', record['model_name']),
+                'predicted_class_id': record['predicted_class_id'],
+                'predicted_class_name': record['predicted_class_name'],
+                'predicted_class_en': record['predicted_class_en'],
+                'confidence': round(record['confidence'] * 100, 2),  # 转为百分比
+                'top_results': top_results,
+                'image_url': record['image_url'] if record['image_url'] else None,  # 图片base64
+                'created_at': record['created_at'].strftime('%Y-%m-%d %H:%M:%S') if record['created_at'] else None
+            })
+        
+        return jsonify({
+            'success': True,
+            'history': history,
+            'total': len(history)
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
 # ============== 启动时尝试加载模型 ==============
