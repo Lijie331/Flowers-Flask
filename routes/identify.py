@@ -17,6 +17,43 @@ from pymysql.cursors import DictCursor
 from config import CHECKPOINT_PATH, MODEL_CONFIG, IMAGE_MEAN, IMAGE_STD, IMAGE_BASE_URL, DB_CONFIG
 
 
+# ============== 多模型配置 ==============
+# 模型配置字典 - 每个模型有独立的checkpoint路径和backbone配置
+MODEL_REGISTRY = {
+    'clip_rn50': {
+        'backbone': 'CLIP-RN50',
+        'resolution': 224,
+        'checkpoint': r"D:\1B.毕业设计\Flowers-Flask\output\RN50\best_model.pth.tar",
+        'display_name': 'ResNet50 (快速)',
+        'description': '快速识别，适合日常使用'
+    },
+    'clip_rn101': {
+        'backbone': 'CLIP-RN101',
+        'resolution': 224,
+        'checkpoint': r"D:\1B.毕业设计\Flowers-Flask\output\RN101\checkpoint.pth.tar",
+        'display_name': 'ResNet101 (平衡)',
+        'description': '速度和精度平衡'
+    },
+    'clip_vit_b16': {
+        'backbone': 'CLIP-ViT-B/16',
+        'resolution': 224,
+        'checkpoint': r"D:\1B.毕业设计\Flowers-Flask\output\ViT-B16\checkpoint.pth.tar",
+        'display_name': 'ViT-B/16 (高精度)',
+        'description': '高精度识别'
+    },
+    'clip_vit_l14': {
+        'backbone': 'CLIP-ViT-L/14',
+        'resolution': 224,
+        'checkpoint': r"D:\1B.毕业设计\Flowers-Flask\output\ViT-L14\checkpoint.pth.tar",
+        'display_name': 'ViT-L/14 (最高精度)',
+        'description': '最高精度，识别效果最好'
+    }
+}
+
+# 当前选中的模型名称
+current_model_name = 'clip_rn50'
+
+
 # 可选token验证（不强制要求登录）
 def optional_token_required(f):
     @wraps(f)
@@ -97,10 +134,22 @@ transform = None
 
 class FlowerClassifier(nn.Module):
     """花卉分类模型 - 支持LIFT训练脚本保存的CosineClassifier格式"""
-    def __init__(self, clip_model, num_classes=120):
+    def __init__(self, clip_model, num_classes=120, weight_dim=None):
         super().__init__()
         self.clip_model = clip_model
-        feat_dim = clip_model.visual.output_dim  # 2048 for RN50
+        
+        # 如果指定了weight_dim，使用它；否则从clip_model获取
+        if weight_dim is not None:
+            feat_dim = weight_dim
+        else:
+            feat_dim = clip_model.visual.output_dim
+        
+        print(f"[INFO] FlowerClassifier: using feature dimension = {feat_dim}")
+        
+        # 保存原始CLIP输出维度
+        self.clip_output_dim = clip_model.visual.output_dim
+        # 保存目标权重维度（从checkpoint来）
+        self.target_weight_dim = feat_dim
         
         # LIFT使用的CosineClassifier结构
         # weight shape: (num_classes, feat_dim)
@@ -111,27 +160,43 @@ class FlowerClassifier(nn.Module):
         self.weight.data.uniform_(-1, 1).renorm_(2, 0, 1e-5).mul_(1e5)
     
     def forward(self, x):
+        # 由于已在加载时禁用了proj层，encode_image现在直接返回ln_post后的特征
         with torch.no_grad():
             features = self.clip_model.encode_image(x)
+        
         # CosineClassifier的forward逻辑
         x = F.normalize(features, dim=-1)
         weight = F.normalize(self.weight, dim=-1)
         return F.linear(x, weight) * self.scale
 
 
-def load_model():
+def load_model(model_name=None):
     """加载训练好的模型"""
-    global model, device
+    global model, device, current_model_name
     
     import torch
     import torch.nn as nn
     from torchvision import transforms
     
+    # 如果没有指定模型，使用当前选中的模型
+    if model_name is None:
+        model_name = current_model_name
+    
+    # 获取模型配置
+    if model_name not in MODEL_REGISTRY:
+        print(f"[ERROR] Unknown model: {model_name}")
+        return False
+    
+    model_config = MODEL_REGISTRY[model_name]
+    checkpoint_path = model_config['checkpoint']
+    backbone_name = model_config['backbone'].lstrip("CLIP-")
+    resolution = model_config['resolution']
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Loading model: {model_name} ({model_config['display_name']})")
     print(f"[INFO] Using device: {device}")
     
     # 1. 加载基础 CLIP 模型
-    backbone_name = MODEL_CONFIG['backbone'].lstrip("CLIP-")
     print(f"[INFO] Loading base CLIP model: {backbone_name}")
     
     try:
@@ -141,6 +206,13 @@ def load_model():
         import clip
         clip_model, _ = clip.load(backbone_name, device=device)
         clip_model.float()
+        
+        # 关键修复：对于ViT模型，需要跳过proj层以匹配训练时的特征维度
+        # 训练时 Peft_ViT 使用 ln_post 之后的特征（投影之前）
+        if 'ViT' in backbone_name and hasattr(clip_model.visual, 'proj') and clip_model.visual.proj is not None:
+            print("[INFO] ViT model detected - will use features before projection layer")
+            clip_model.visual.proj = None  # 禁用投影层，输出 ln_post 之后的特征
+        
         print("[INFO] Base CLIP model loaded successfully")
         
     except Exception as e:
@@ -152,20 +224,25 @@ def load_model():
     # 2. 构建分类模型
     print("[INFO] Building classification model...")
     try:
-        # 从checkpoint中获取实际的类别数
-        if os.path.exists(CHECKPOINT_PATH):
-            checkpoint = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
+        # 从checkpoint中获取实际的类别数和特征维度
+        weight_dim = None
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
             if 'head' in checkpoint and 'weight' in checkpoint['head']:
                 num_classes = checkpoint['head']['weight'].shape[0]
-                print(f"[INFO] Detected {num_classes} classes from checkpoint")
+                weight_dim = checkpoint['head']['weight'].shape[1]  # 特征维度
+                print(f"[INFO] Detected {num_classes} classes with feature dim {weight_dim} from checkpoint")
             else:
-                num_classes = 120
+                num_classes = 102
         else:
-            num_classes = 120
+            num_classes = 102
+            print(f"[WARNING] Checkpoint not found: {checkpoint_path}, using default 102 classes")
         
-        model = FlowerClassifier(clip_model, num_classes)
-        model.to(device)
-        model.eval()
+        # 使用checkpoint中的weight_dim来创建分类器
+        classifier_model = FlowerClassifier(clip_model, num_classes, weight_dim=weight_dim)
+        classifier_model.to(device)
+        classifier_model.eval()
+        
     except Exception as e:
         print(f"[ERROR] Failed to build model: {e}")
         import traceback
@@ -173,14 +250,14 @@ def load_model():
         return False
     
     # 3. 加载训练好的权重
-    print(f"[INFO] Loading checkpoint from: {CHECKPOINT_PATH}")
+    print(f"[INFO] Loading checkpoint from: {checkpoint_path}")
     
-    if not os.path.exists(CHECKPOINT_PATH):
-        print(f"[ERROR] Checkpoint not found: {CHECKPOINT_PATH}")
+    if not os.path.exists(checkpoint_path):
+        print(f"[ERROR] Checkpoint not found: {checkpoint_path}")
         return False
     
     try:
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
         # LIFT训练脚本保存的格式: tuner, head
         # head 包含 CosineClassifier 的 weight 和 scale
@@ -199,15 +276,17 @@ def load_model():
                 new_state_dict[new_key] = v
             
             # 加载权重
-            model.load_state_dict(new_state_dict, strict=False)
+            classifier_model.load_state_dict(new_state_dict, strict=False)
             print(f"[INFO] Head weights loaded: {list(new_state_dict.keys())}")
         
         # 如果有tuner权重（可能是CLIP微调的参数）
         if 'tuner' in checkpoint:
             print("[INFO] Found tuner weights (CLIP fine-tuning)")
-            # LIFT中tuner通常是空的，除非启用full_tuning
         
-        print("[INFO] Model loaded successfully!")
+        # 更新当前模型
+        model = classifier_model
+        current_model_name = model_name
+        print(f"[INFO] Model '{model_config['display_name']}' loaded successfully!")
         return True
         
     except Exception as e:
@@ -242,18 +321,112 @@ def health_check():
         'status': 'ok',
         'message': 'Flower recognition service is running',
         'model_loaded': model is not None,
+        'model_name': current_model_name,
         'device': str(device) if device else 'not initialized'
     })
+
+
+@bp.route('/models', methods=['GET'])
+def get_available_models():
+    """获取所有可用的模型列表"""
+    models_list = []
+    for name, config in MODEL_REGISTRY.items():
+        checkpoint_exists = os.path.exists(config['checkpoint'])
+        models_list.append({
+            'value': name,
+            'label': config['display_name'],
+            'description': config['description'],
+            'backbone': config['backbone'],
+            'checkpoint_exists': checkpoint_exists,
+            'is_current': name == current_model_name
+        })
+    
+    return jsonify({
+        'success': True,
+        'models': models_list,
+        'current_model': current_model_name
+    })
+
+
+@bp.route('/switch', methods=['POST'])
+def switch_model():
+    """切换模型接口"""
+    global model, device
+    
+    if request.is_json:
+        data = request.get_json()
+        model_name = data.get('model')
+    else:
+        model_name = request.form.get('model')
+    
+    if not model_name:
+        return jsonify({
+            'success': False,
+            'error': 'Model name is required'
+        }), 400
+    
+    if model_name not in MODEL_REGISTRY:
+        return jsonify({
+            'success': False,
+            'error': f'Unknown model: {model_name}'
+        }), 400
+    
+    if model_name == current_model_name and model is not None:
+        return jsonify({
+            'success': True,
+            'message': f'Already using model: {MODEL_REGISTRY[model_name]["display_name"]}',
+            'model': model_name,
+            'display_name': MODEL_REGISTRY[model_name]['display_name']
+        })
+    
+    print(f"[INFO] Switching to model: {model_name}")
+    if load_model(model_name):
+        return jsonify({
+            'success': True,
+            'message': f'Successfully switched to: {MODEL_REGISTRY[model_name]["display_name"]}',
+            'model': model_name,
+            'display_name': MODEL_REGISTRY[model_name]['display_name']
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'error': 'Failed to switch model'
+        }), 500
 
 
 @bp.route('/classify', methods=['POST'])
 @optional_token_required
 def classify_flower():
     """花卉识别接口"""
-    global model, device
+    global model, device, current_model_name
     
     from flask import g
     import torch
+    
+    # 获取请求中的模型参数
+    requested_model = None
+    if request.is_json:
+        data = request.get_json()
+        requested_model = data.get('model')
+        top_k = data.get('top_k', 5)
+    elif 'image' in request.files:
+        requested_model = request.form.get('model')
+        top_k = int(request.form.get('top_k', 5))
+    
+    # 如果请求的模型与当前模型不同，需要切换模型
+    if requested_model and requested_model != current_model_name:
+        if requested_model in MODEL_REGISTRY:
+            print(f"[INFO] Switching model from '{current_model_name}' to '{requested_model}'")
+            if not load_model(requested_model):
+                return jsonify({
+                    'success': False,
+                    'error': f'Failed to load model: {requested_model}'
+                }), 500
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Unknown model: {requested_model}'
+            }), 400
     
     # 确保模型已加载
     if model is None:
@@ -402,7 +575,7 @@ def get_classes():
 # ============== 启动时尝试加载模型 ==============
 print("[INFO] ========== 正在加载花卉识别模型 ==========")
 try:
-    load_model()
+    load_model(current_model_name)
 except Exception as e:
     print(f"[WARNING] 模型加载失败: {e}")
 print(f"[INFO] ========== 模型加载完成 ==========")
