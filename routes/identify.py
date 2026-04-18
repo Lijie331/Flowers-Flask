@@ -551,11 +551,35 @@ def classify_flower():
                 conn = pymysql.connect(**DB_CONFIG)
                 cursor = conn.cursor()
                 sql = """
+
                 INSERT INTO identify_history 
                 (user_id, image_url, model_name, predicted_class_id, predicted_class_name, 
                  predicted_class_en, confidence, top_results)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """
+
+                
+                cursor.execute("""
+                    SELECT COUNT(*) as count 
+                    FROM identify_history 
+                    WHERE user_id = %s
+                """, (g.user_id,))
+                count = cursor.fetchone()[0]
+
+                # 2️⃣ 如果 >=20，删除最早的一条
+                if count >= 20:
+                    print("[DEBUG] 超过20条，删除最早记录")
+                    cursor.execute("""
+                        DELETE FROM identify_history
+                        WHERE id = (
+                            SELECT id FROM (
+                                SELECT id FROM identify_history
+                                WHERE user_id = %s
+                                ORDER BY created_at ASC
+                                LIMIT 1
+                            ) as tmp
+                        )
+                    """, (g.user_id,))
                 cursor.execute(sql, (
                     g.user_id,  # 用户ID
                     image_data[:30000] if len(image_data) > 30000 else image_data,  # 图片base64（限制30KB）
@@ -614,45 +638,64 @@ def get_classes():
 @bp.route('/identify/history', methods=['GET'])
 @optional_token_required
 def get_identify_history():
-    """获取用户的识别历史记录（最近20条）"""
-    from flask import g
-    
+    from flask import g, request
+    import json
+
     user_id = g.user_id
-    
-    # 如果未登录，返回空列表
+
     if not user_id:
         return jsonify({
             'success': True,
             'history': [],
             'total': 0,
-            'message': '未登录用户无历史记录'
+            'page': 1,
+            'page_size': 10
         })
-    
+
     try:
+        # ✅ 获取分页参数（默认）
+        page = int(request.args.get('page', 1))
+        page_size = int(request.args.get('page_size', 10))
+
+        # 防止乱传参数
+        page = max(page, 1)
+        page_size = min(max(page_size, 1), 50)  # 限制最大50条
+
+        offset = (page - 1) * page_size
+
         conn = pymysql.connect(**DB_CONFIG)
         cursor = conn.cursor(pymysql.cursors.DictCursor)
-        
-        sql = """
-        SELECT id, model_name, predicted_class_id, predicted_class_name, 
-               predicted_class_en, confidence, top_results, image_url, created_at
-        FROM identify_history
-        WHERE user_id = %s
-        ORDER BY created_at DESC
-        LIMIT 20
-        """
-        cursor.execute(sql, (user_id,))
+
+        # ✅ 1. 查询总数
+        cursor.execute("""
+            SELECT COUNT(*) as total
+            FROM identify_history
+            WHERE user_id = %s
+        """, (user_id,))
+        total = cursor.fetchone()['total']
+
+        # ✅ 2. 分页查询
+        cursor.execute("""
+            SELECT id, model_name, predicted_class_id, predicted_class_name, 
+                   predicted_class_en, confidence, top_results, image_url, created_at
+            FROM identify_history
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """, (user_id, page_size, offset))
+
         records = cursor.fetchall()
-        
+
         cursor.close()
         conn.close()
-        
-        # 转换置信度为百分比格式
+
+        # ✅ 数据处理
         history = []
         for record in records:
             top_results = record['top_results']
             if isinstance(top_results, str):
                 top_results = json.loads(top_results)
-            
+
             history.append({
                 'id': record['id'],
                 'model_name': record['model_name'],
@@ -660,18 +703,21 @@ def get_identify_history():
                 'predicted_class_id': record['predicted_class_id'],
                 'predicted_class_name': record['predicted_class_name'],
                 'predicted_class_en': record['predicted_class_en'],
-                'confidence': round(record['confidence'] * 100, 2),  # 转为百分比
+                'confidence': round(record['confidence'] * 100, 2),
                 'top_results': top_results,
-                'image_url': record['image_url'] if record['image_url'] else None,  # 图片base64
+                'image_url': record['image_url'],
                 'created_at': record['created_at'].strftime('%Y-%m-%d %H:%M:%S') if record['created_at'] else None
             })
-        
+
         return jsonify({
             'success': True,
             'history': history,
-            'total': len(history)
+            'total': total,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (total + page_size - 1) // page_size
         })
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -679,7 +725,6 @@ def get_identify_history():
             'success': False,
             'error': str(e)
         }), 500
-
 
 # ============== 启动时尝试加载模型 ==============
 print("[INFO] ========== 正在加载花卉识别模型 ==========")
