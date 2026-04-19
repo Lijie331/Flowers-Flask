@@ -9,7 +9,7 @@ def register_routes(app: Flask):
     """注册所有路由蓝图"""
     
     # 延迟导入避免循环依赖
-    from . import gallery, encyclopedia, identify, auth, community, user
+    from . import gallery, encyclopedia, identify, auth, community, user, admin
     
     # 注册蓝图
     app.register_blueprint(gallery.bp) #图库
@@ -18,7 +18,7 @@ def register_routes(app: Flask):
     app.register_blueprint(auth.bp)  # 用户认证
     app.register_blueprint(community.bp)  # 社区功能
     app.register_blueprint(user.bp)  # 用户资料和成长体系
-    
+    app.register_blueprint(admin.admin_bp)
     print("[INFO] 所有路由蓝图注册完成")
 
 

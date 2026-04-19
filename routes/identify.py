@@ -324,17 +324,27 @@ def health_check():
 
 @bp.route('/models', methods=['GET'])
 def get_available_models():
-    """获取所有可用的模型列表"""
+    """获取所有可用的模型列表（从数据库读取状态）"""
+    from config import DB_CONFIG
+    conn = pymysql.connect(**DB_CONFIG)
+    cursor = conn.cursor(pymysql.cursors.DictCursor)
+    cursor.execute("SELECT model_id as value, name as label, badge, enabled FROM model_status")
+    db_models = {row['value']: row for row in cursor.fetchall()}
+    cursor.close()
+    conn.close()
+    
     models_list = []
     for name, config in MODEL_REGISTRY.items():
         checkpoint_exists = os.path.exists(config['checkpoint'])
+        db_model = db_models.get(name, {})
         models_list.append({
             'value': name,
             'label': config['display_name'],
             'description': config['description'],
             'backbone': config['backbone'],
             'checkpoint_exists': checkpoint_exists,
-            'is_current': name == current_model_name
+            'is_current': name == current_model_name,
+            'enabled': db_model.get('enabled', True) if db_model else True
         })
     
     return jsonify({
@@ -348,6 +358,7 @@ def get_available_models():
 def switch_model():
     """切换模型接口"""
     global model, device
+    from config import DB_CONFIG
     
     if request.is_json:
         data = request.get_json()
@@ -365,6 +376,20 @@ def switch_model():
         return jsonify({
             'success': False,
             'error': f'Unknown model: {model_name}'
+        }), 400
+    
+    # 检查模型是否被禁用（从数据库读取）
+    conn = pymysql.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    cursor.execute("SELECT enabled FROM model_status WHERE model_id = %s", (model_name,))
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if result and result[0] == 0:
+        return jsonify({
+            'success': False,
+            'error': f'模型 {MODEL_REGISTRY[model_name]["display_name"]} 已被禁用，无法切换'
         }), 400
     
     if model_name == current_model_name and model is not None:
@@ -412,6 +437,20 @@ def classify_flower():
     # 如果请求的模型与当前模型不同，需要切换模型
     if requested_model and requested_model != current_model_name:
         if requested_model in MODEL_REGISTRY:
+            # 检查模型是否被禁用（从数据库读取）
+            conn = pymysql.connect(**DB_CONFIG)
+            cursor = conn.cursor()
+            cursor.execute("SELECT enabled FROM model_status WHERE model_id = %s", (requested_model,))
+            result = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            if result and result[0] == 0:
+                return jsonify({
+                    'success': False,
+                    'error': f'模型 {MODEL_REGISTRY[requested_model]["display_name"]} 已被禁用'
+                }), 400
+            
             print(f"[INFO] Switching model from '{current_model_name}' to '{requested_model}'")
             if not load_model(requested_model):
                 return jsonify({
@@ -438,18 +477,31 @@ def classify_flower():
     try:
         # 获取图片和原始数据
         image_data = ''  # 用于保存历史记录
+        crop_params = None  # 裁剪参数
+
         if request.is_json:
             data = request.get_json()
             top_k = data.get('top_k', 5)
             image_data = data.get('image', '')
             debug_mode = data.get('debug', False)
-            
+
+            # 获取裁剪参数
+            if all(k in data for k in ('crop_left', 'crop_top', 'crop_width', 'crop_height', 'image_width', 'image_height')):
+                crop_params = {
+                    'left': data['crop_left'],
+                    'top': data['crop_top'],
+                    'width': data['crop_width'],
+                    'height': data['crop_height'],
+                    'orig_width': data['image_width'],
+                    'orig_height': data['image_height']
+                }
+
             if not image_data:
                 return jsonify({'success': False, 'error': 'Missing image data'}), 400
-            
+
             image_bytes = base64.b64decode(image_data)
             image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        
+
         elif 'image' in request.files:
             file = request.files['image']
             top_k = int(request.form.get('top_k', 5))
@@ -457,10 +509,47 @@ def classify_flower():
             debug_mode = request.form.get('debug', 'false').lower() == 'true'
             # 对于文件上传，暂时不支持保存图片
             image_data = ''
-        
+
+            # 获取裁剪参数（表单形式）
+            if all(k in request.form for k in ('crop_left', 'crop_top', 'crop_width', 'crop_height', 'image_width', 'image_height')):
+                crop_params = {
+                    'left': int(request.form['crop_left']),
+                    'top': int(request.form['crop_top']),
+                    'width': int(request.form['crop_width']),
+                    'height': int(request.form['crop_height']),
+                    'orig_width': int(request.form['image_width']),
+                    'orig_height': int(request.form['image_height'])
+                }
+
         else:
             return jsonify({'success': False, 'error': 'No image provided'}), 400
-        
+
+        # 如果有裁剪参数，对图片进行裁剪
+        if crop_params:
+            img_width, img_height = image.size
+            orig_width = crop_params['orig_width']
+            orig_height = crop_params['orig_height']
+
+            # 将前端坐标转换为实际图片坐标
+            # 前端坐标是基于 orig_width/height 的，需要映射到实际图片尺寸
+            scale_x = img_width / orig_width if orig_width > 0 else 1
+            scale_y = img_height / orig_height if orig_height > 0 else 1
+
+            left = int(crop_params['left'] * scale_x)
+            top = int(crop_params['top'] * scale_y)
+            crop_width = int(crop_params['width'] * scale_x)
+            crop_height = int(crop_params['height'] * scale_y)
+
+            # 确保裁剪区域在图片范围内
+            left = max(0, min(left, img_width - 1))
+            top = max(0, min(top, img_height - 1))
+            crop_width = min(crop_width, img_width - left)
+            crop_height = min(crop_height, img_height - top)
+
+            if crop_width > 0 and crop_height > 0:
+                image = image.crop((left, top, left + crop_width, top + crop_height))
+                print(f"[DEBUG] 图片已裁剪: ({left}, {top}, {crop_width}, {crop_height})")
+
         # 预处理图像
         img_tensor = trans(image).unsqueeze(0).to(device)
         

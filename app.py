@@ -26,18 +26,19 @@ import traceback
 
 # 创建Flask应用
 app = Flask(__name__, static_folder='static', static_url_path='/static')
-CORS(app)
+
+# 配置 CORS - 允许所有来源和所有方法
+CORS(app, resources={
+    r"/api/*": {
+        "origins": "*",
+        "supports_credentials": True,
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allowed_headers": ["Content-Type", "Authorization"]
+    }
+}, expose_headers=['Content-Type', 'Authorization'])
 
 # 注册所有路由
 register_routes(app)
-
-# 配置 CORS
-CORS(app, resources={
-    r"/api/*": {
-        "origins": ["http://localhost:5173", "http://127.0.0.1:5173"],
-        "supports_credentials": True
-    }
-})
 
 # 全局错误处理
 @app.errorhandler(Exception)
