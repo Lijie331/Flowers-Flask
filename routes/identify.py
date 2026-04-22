@@ -513,12 +513,12 @@ def classify_flower():
             # 获取裁剪参数（表单形式）
             if all(k in request.form for k in ('crop_left', 'crop_top', 'crop_width', 'crop_height', 'image_width', 'image_height')):
                 crop_params = {
-                    'left': int(request.form['crop_left']),
-                    'top': int(request.form['crop_top']),
-                    'width': int(request.form['crop_width']),
-                    'height': int(request.form['crop_height']),
-                    'orig_width': int(request.form['image_width']),
-                    'orig_height': int(request.form['image_height'])
+                    'left': int(round(float(request.form['crop_left']))),
+                    'top': int(round(float(request.form['crop_top']))),
+                    'width': int(round(float(request.form['crop_width']))),
+                    'height': int(round(float(request.form['crop_height']))),
+                    'orig_width': int(round(float(request.form['image_width']))),
+                    'orig_height': int(round(float(request.form['image_height'])))
                 }
 
         else:

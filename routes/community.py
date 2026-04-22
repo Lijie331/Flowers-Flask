@@ -488,7 +488,7 @@ def update_garden_plant(plant_id):
         updates = []
         params = []
         
-        for field in ['nickname', 'location', 'status', 'notes']:
+        for field in ['nickname', 'location', 'status', 'notes', 'water_frequency', 'fertilize_frequency']:
             if field in data:
                 updates.append(f"{field} = %s")
                 params.append(data[field])
@@ -943,8 +943,9 @@ def create_post():
 
         post_id = cursor.lastrowid
 
-        # 如果是AI审核进入pending状态，发送通知给用户
+        # 如果是AI审核进入pending状态，发送通知给用户和所有管理员
         if post_status == 'pending':
+            # 通知用户
             try:
                 create_notification(
                     user_id=user_id,
@@ -958,6 +959,26 @@ def create_post():
                 )
             except Exception as notif_err:
                 print(f"[WARN] 发送审核通知失败: {notif_err}")
+
+            # 通知所有管理员
+            try:
+                cursor.execute("SELECT id FROM users WHERE is_admin = 1")
+                admins = cursor.fetchall()
+                for admin in admins:
+                    create_notification(
+                        user_id=admin['id'],
+                        actor_id='system',
+                        actor_name='系统',
+                        actor_avatar='',
+                        notification_type='system',
+                        target_type='post',
+                        target_id=post_id,
+                        target_content=f'有新的帖子待审核（ID: {post_id}）'
+                    )
+                if admins:
+                    print(f"[INFO] 已通知 {len(admins)} 位管理员有新帖子待审核")
+            except Exception as notif_err:
+                print(f"[WARN] 发送管理员通知失败: {notif_err}")
 
         # 更新用户发帖数（只有审核通过的才增加）
         if post_status == 'approved':
