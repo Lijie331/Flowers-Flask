@@ -91,8 +91,8 @@ init_env()
 
 # ============== 阿里云内容审核配置 ==============
 ALIYUN_CONTENT_MODERATION = {
-    'access_key_id': 'LTAI5t9XhhSYYWHVHsHjV7RT',
-    'access_key_secret': 'i5jYF5DNlofWtPzkBB00YAmCcIqHsM',
+    'access_key_id': os.environ.get('OSS_ACCESS_KEY_ID'),
+    'access_key_secret': os.environ.get('OSS_ACCESS_KEY_SECRET'),
     'region': 'cn-shanghai',
     'endpoint': 'green-cip.cn-shanghai.aliyuncs.com',
     'app_id': 'img_txt_check_agent_01',
@@ -102,15 +102,69 @@ ALIYUN_CONTENT_MODERATION = {
         'P1': 50,
         'P2': 30,
     },
-    'P0_LABELS': ['politics', 'terror', 'minor', 'propaganda', 'extremism', 'cult'],
-    'P1_LABELS': ['porn', 'vulgar', 'gore', 'violence', 'advertising', 'junk'],
-    'P2_LABELS': ['minor_abuse', 'soft_ad'],
+    'P0_LABELS': [
+        # 英文标签（文本审核）
+        'politics', 'terror', 'extremism', 'cult', 'illegal_content',
+        'inappropriate_profanity', 'political_figure', '诱导犯罪',
+        # 中文标签（图片审核）
+        '涉政敏感', '暴恐血腥', '邪教_封建迷信违规', '教唆违法_危害公共安全',
+        '侮辱英烈_历史虚无主义', '未成年人保护相关违规'
+    ],
+    'P1_LABELS': [
+        # 英文标签（文本审核）
+        'porn', 'vulgar', 'violence', 'advertising', 'junk', 'fraud',
+        'hate_speech', 'personal_attack', 'security_ threat', '钓鱼',
+        # 中文标签（图片审核）
+        '色情低俗', '辱骂谩骂人身攻击', '垃圾广告_营销导流', '违禁物品_违法交易',
+        '诈骗_赌博_洗钱诱导', '仇恨言论_歧视', '隐私信息泄露', '恶意网址_木马引流'
+    ],
+    'P2_LABELS': ['minor_abuse', 'soft_ad', '诱导未成年人'],
+    # 标签中文映射（用于前端显示）
+    'LABEL_DISPLAY_MAP': {
+        # 英文转中文
+        'politics': '涉政敏感',
+        'terror': '暴恐血腥',
+        'extremism': '极端主义',
+        'cult': '邪教封建迷信',
+        'illegal_content': '违法内容',
+        'inappropriate_profanity': '不当脏话',
+        'political_figure': '政治敏感人物',
+        '诱导犯罪': '诱导犯罪',
+        'porn': '色情低俗',
+        'vulgar': '低俗内容',
+        'violence': '暴力内容',
+        'advertising': '广告推广',
+        'junk': '垃圾广告',
+        'fraud': '欺诈诈骗',
+        'hate_speech': '仇恨言论',
+        'personal_attack': '人身攻击',
+        'security_threat': '安全威胁',
+        '钓鱼': '钓鱼诈骗',
+        'minor_abuse': '未成年人违规',
+        'soft_ad': '软色情',
+        '诱导未成年人': '诱导未成年人',
+        # 中文标签（直接显示）
+        '涉政敏感': '涉政敏感',
+        '暴恐血腥': '暴恐血腥',
+        '色情低俗': '色情低俗',
+        '辱骂谩骂人身攻击': '辱骂谩骂人身攻击',
+        '垃圾广告_营销导流': '垃圾广告营销导流',
+        '违禁物品_违法交易': '违禁物品违法交易',
+        '诈骗_赌博_洗钱诱导': '诈骗赌博洗钱诱导',
+        '仇恨言论_歧视': '仇恨言论歧视',
+        '教唆违法_危害公共安全': '教唆违法危害公共安全',
+        '隐私信息泄露': '隐私信息泄露',
+        '恶意网址_木马引流': '恶意网址木马引流',
+        '邪教_封建迷信违规': '邪教封建迷信违规',
+        '未成年人保护相关违规': '未成年人保护相关违规',
+        '侮辱英烈_历史虚无主义': '侮辱英烈历史虚无主义',
+    },
 }
 
 # ============== 阿里云OSS配置 ==============
 ALIYUN_OSS = {
-    'access_key_id': 'LTAI5t9XhhSYYWHVHsHjV7RT',
-    'access_key_secret': 'i5jYF5DNlofWtPzkBB00YAmCcIqHsM',
+    'access_key_id': os.environ.get('OSS_ACCESS_KEY_ID'),
+    'access_key_secret': os.environ.get('OSS_ACCESS_KEY_SECRET'),
     'endpoint': 'oss-cn-beijing.aliyuncs.com',
     'bucket_name': 'flowers-buck',
 }

@@ -875,24 +875,41 @@ def create_post():
 
         # 根据审核结果确定帖子状态和审核信息
         if moderation_result['suggestion'] == 'block':
-            # P0直接拒绝
-            conn.close()
-            return jsonify({
-                'success': False,
-                'error': '内容审核未通过，请修改后重试',
-                'audit': {
-                    'risk_level': moderation_result['risk_level'],
-                    'labels': moderation_result['labels'],
-                    'reason': '您的内容包含不当信息'
-                }
-            }), 400
+            # P0文本/图片违规，进入人工审核
+            post_status = 'pending'
+            # 区分文本和图片的标签
+            text_labels = moderation_result.get('details', {}).get('text', {}).get('labels', [])
+            image_labels = []
+            for img_result in moderation_result.get('details', {}).get('images', []):
+                image_labels.extend(img_result.get('labels', []))
+            all_labels = list(set(text_labels + image_labels))  # 合并所有标签
+            display_labels = moderation_result.get('labels_display', [])
+            audit_info = json.dumps({
+                'risk_level': moderation_result['risk_level'],
+                'labels': all_labels,  # 合并的标签（兼容旧数据）
+                'labels_display': display_labels,  # 中文显示标签
+                'text_labels': text_labels,  # 文本违规标签
+                'image_labels': image_labels,  # 图片违规标签
+                'max_score': moderation_result['max_score'],
+                'audit_type': 'ai_block_pending',
+                'ai_review_time': datetime.now().isoformat()
+            }, ensure_ascii=False)
 
         elif moderation_result['suggestion'] == 'review':
             # P1进入人工审核
             post_status = 'pending'
+            text_labels = moderation_result.get('details', {}).get('text', {}).get('labels', [])
+            image_labels = []
+            for img_result in moderation_result.get('details', {}).get('images', []):
+                image_labels.extend(img_result.get('labels', []))
+            all_labels = list(set(text_labels + image_labels))
+            display_labels = moderation_result.get('labels_display', [])
             audit_info = json.dumps({
                 'risk_level': moderation_result['risk_level'],
-                'labels': moderation_result['labels'],
+                'labels': all_labels,
+                'labels_display': display_labels,
+                'text_labels': text_labels,
+                'image_labels': image_labels,
                 'max_score': moderation_result['max_score'],
                 'audit_type': 'ai_pending',
                 'ai_review_time': datetime.now().isoformat()

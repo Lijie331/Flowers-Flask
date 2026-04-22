@@ -82,6 +82,18 @@ class ContentModerationClient:
             traceback.print_exc()
             return None
 
+    def _get_display_labels(self, labels):
+        """将标签转换为中文显示"""
+        config = ALIYUN_CONTENT_MODERATION
+        display_map = config.get('LABEL_DISPLAY_MAP', {})
+        display_labels = []
+        for label in labels:
+            if label in display_map:
+                display_labels.append(display_map[label])
+            else:
+                display_labels.append(label)  # 未找到映射的保留原样
+        return display_labels
+
     def moderate_content(self, content, images=None):
         """
         审核内容（文本+图片）
@@ -91,12 +103,13 @@ class ContentModerationClient:
                 'pass': bool,
                 'risk_level': str,  # P0/P1/P2/none
                 'labels': list,
+                'labels_display': list,  # 中文显示标签
                 'max_score': float,
                 'suggestion': str  # block/review/pass
             }
         """
         if not ENABLE_CONTENT_MODERATION:
-            return {'pass': True, 'risk_level': 'none', 'labels': [], 'max_score': 0, 'suggestion': 'pass'}
+            return {'pass': True, 'risk_level': 'none', 'labels': [], 'labels_display': [], 'max_score': 0, 'suggestion': 'pass'}
 
         results = {
             'text': None,
@@ -126,10 +139,14 @@ class ContentModerationClient:
         final_pass = final_risk_level == 'none'
         final_suggestion = self._labels_to_suggestion(final_risk_level)
 
+        # 获取中文显示标签
+        display_labels = self._get_display_labels(list(set(all_labels)))
+
         return {
             'pass': final_pass,
             'risk_level': final_risk_level,
             'labels': list(set(all_labels)),
+            'labels_display': display_labels,
             'max_score': max_score,
             'suggestion': final_suggestion,
             'details': results
@@ -193,16 +210,16 @@ class ContentModerationClient:
                 'DataId': str(uuid.uuid4())
             }
 
-            request = models.MultiModalAgentRequest(
-                app_id=self.app_id,
+            request = models.ImageModerationRequest(
+                service='baselineCheckByVL',
                 service_parameters=json.dumps(service_params)
             )
 
             print(f"[DEBUG] 发送图片审核请求: {oss_url}")
-            response = self.clt.multi_modal_agent(request)
+            response = self.clt.image_moderation(request)
 
             if response.status_code == 200:
-                return self._parse_agent_response(response.body)
+                return self._parse_image_response(response.body)
             else:
                 return {
                     'pass': False,
@@ -280,52 +297,47 @@ class ContentModerationClient:
                 'error': str(e)
             }
 
-    def _parse_agent_response(self, body):
-        """解析智能体审核响应"""
+    def _parse_image_response(self, body):
+        """解析图片审核响应（baselineCheckByVL）"""
         try:
-            print(f"[DEBUG] 智能体响应体: code={body.code}, message={body.message}")
+            print(f"[DEBUG] 图片审核响应体: {body}")
 
-            code = body.code
-            data = body.data
-
-            if code not in (200, '200', 'OK'):
-                return {
-                    'pass': False,
-                    'risk_level': 'P1',
-                    'labels': ['api_error'],
-                    'score': 50,
-                    'suggestion': 'review',
-                    'error': body.message or f'Code: {code}'
-                }
-
+            # ImageModerationResponseBody 结构不同，直接从 body 获取结果
             labels = []
+            max_confidence = 0
             risk_level_str = 'none'
 
-            if data and hasattr(data, 'result') and data.result:
-                for item in data.result:
-                    label = getattr(item, 'label', '') or ''
-                    if label:
-                        labels.append(label)
+            # 检查是否有 result
+            if hasattr(body, 'data') and body.data:
+                data = body.data
+                if hasattr(data, 'result') and data.result:
+                    for item in data.result:
+                        label = getattr(item, 'label', '') or ''
+                        confidence = float(getattr(item, 'confidence', 0) or 0)
+                        if label and label != 'nonLabel':
+                            labels.append(label)
+                        if confidence > max_confidence:
+                            max_confidence = confidence
 
-            if data and hasattr(data, 'risk_level'):
-                risk_level_str = data.risk_level
+                if hasattr(data, 'risk_level'):
+                    risk_level_str = data.risk_level
 
-            risk_map = {'high': 'P0', 'medium': 'P1', 'low': 'P2', 'none': 'none'}
-            mapped_risk = risk_map.get(risk_level_str, 'none')
+            # 根据标签判断风险等级
+            mapped_risk = self._determine_risk_level(labels, max_confidence)
             suggestion = self._labels_to_suggestion(mapped_risk)
 
-            print(f"[INFO] 智能体审核结果: labels={labels}, risk={mapped_risk}")
+            print(f"[INFO] 图片审核结果: labels={labels}, risk={mapped_risk}")
 
             return {
                 'pass': mapped_risk == 'none',
                 'risk_level': mapped_risk,
                 'labels': labels,
-                'score': 50 if mapped_risk != 'none' else 0,
+                'score': max_confidence,
                 'suggestion': suggestion
             }
 
         except Exception as e:
-            print(f"[ERROR] 解析智能体响应失败: {e}")
+            print(f"[ERROR] 解析图片审核响应失败: {e}")
             import traceback
             traceback.print_exc()
             return {
