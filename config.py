@@ -95,6 +95,7 @@ ALIYUN_CONTENT_MODERATION = {
     'access_key_secret': 'i5jYF5DNlofWtPzkBB00YAmCcIqHsM',
     'region': 'cn-shanghai',
     'endpoint': 'green-cip.cn-shanghai.aliyuncs.com',
+    'app_id': 'img_txt_check_agent_01',
     'scenes': ['text', 'image', 'video'],
     'thresholds': {
         'P0': 60,
@@ -104,6 +105,14 @@ ALIYUN_CONTENT_MODERATION = {
     'P0_LABELS': ['politics', 'terror', 'minor', 'propaganda', 'extremism', 'cult'],
     'P1_LABELS': ['porn', 'vulgar', 'gore', 'violence', 'advertising', 'junk'],
     'P2_LABELS': ['minor_abuse', 'soft_ad'],
+}
+
+# ============== 阿里云OSS配置 ==============
+ALIYUN_OSS = {
+    'access_key_id': 'LTAI5t9XhhSYYWHVHsHjV7RT',
+    'access_key_secret': 'i5jYF5DNlofWtPzkBB00YAmCcIqHsM',
+    'endpoint': 'oss-cn-beijing.aliyuncs.com',
+    'bucket_name': 'flowers-buck',
 }
 
 # 是否启用AI内容审核

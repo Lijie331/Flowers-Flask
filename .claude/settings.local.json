@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"from alibabacloud_green20220302 import models; r = models.MultiModalAgentRequest\\(\\); print\\(type\\(r\\)\\); print\\([x for x in dir\\(r\\) if not x.startswith\\('_'\\)]\\)\")"
+      "Bash(python -c \"from alibabacloud_green20220302 import models; r = models.MultiModalAgentRequest\\(\\); print\\(type\\(r\\)\\); print\\([x for x in dir\\(r\\) if not x.startswith\\('_'\\)]\\)\")",
+      "Bash(python -c \"from alibabacloud_green20220302 import models; body = models.MultiModalAgentResponseBody\\(\\); body.code = 'OK'; body.message = 'success'; body.data = None; print\\('str\\(body.code\\):', str\\(body.code\\)\\); print\\('str\\(body.code\\) != 200:', str\\(body.code\\) != '200'\\)\")"
     ]
   }
 }
