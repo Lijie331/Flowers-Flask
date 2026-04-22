@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from alibabacloud_green20220302 import models; r = models.MultiModalAgentRequest\\(\\); print\\(type\\(r\\)\\); print\\([x for x in dir\\(r\\) if not x.startswith\\('_'\\)]\\)\")"
+    ]
+  }
+}

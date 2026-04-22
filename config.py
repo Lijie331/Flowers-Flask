@@ -94,7 +94,7 @@ ALIYUN_CONTENT_MODERATION = {
     'access_key_id': 'LTAI5t9XhhSYYWHVHsHjV7RT',
     'access_key_secret': 'i5jYF5DNlofWtPzkBB00YAmCcIqHsM',
     'region': 'cn-shanghai',
-    'endpoint': 'green.cn-shanghai.aliyuncs.com',
+    'endpoint': 'green-cip.cn-shanghai.aliyuncs.com',
     'scenes': ['text', 'image', 'video'],
     'thresholds': {
         'P0': 60,
