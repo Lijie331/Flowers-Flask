@@ -745,31 +745,38 @@ def get_posts():
     page = int(request.args.get('page', 1))
     page_size = int(request.args.get('page_size', 10))
     user_id = request.args.get('user_id')  # 可选：只看某用户的帖子
-    
+
     conn = get_db_connection()
     cursor = conn.cursor(DictCursor)
-    
+
     try:
-        where = "WHERE 1=1"
-        params = []
-        
-        if user_id:
-            where += " AND p.user_id = %s"
-            params.append(user_id)
-        
-        # 查询总数
-        cursor.execute(f"SELECT COUNT(*) as total FROM posts p {where}", params)
-        total = cursor.fetchone()['total']
-        
-        # 分页查询 - 使用 user_profiles 的 nickname 和 avatar_url
-        offset = (page - 1) * page_size
-        
-        # 获取当前登录用户的ID（如果有token）
+        # 获取当前登录用户的ID和是否管理员
         from routes.auth import get_user_id_by_token
         token = request.headers.get('Authorization', '').replace('Bearer ', '')
         current_user_id = get_user_id_by_token(token) if token else None
         query_user_id = current_user_id if current_user_id else request.headers.get('X-User-Id', '')
-        
+
+        # 检查是否为管理员
+        is_admin = False
+        if current_user_id:
+            cursor.execute("SELECT is_admin FROM users WHERE id = %s", (current_user_id,))
+            result = cursor.fetchone()
+            is_admin = result and result.get('is_admin', 0) == 1
+
+        # 所有人都只能看到已通过的帖子，待审核帖子只能在审核列表查看
+        where = "WHERE p.status = 'approved'"
+        params = []
+        if user_id:
+            where += " AND p.user_id = %s"
+            params.append(user_id)
+
+        # 查询总数
+        cursor.execute(f"SELECT COUNT(*) as total FROM posts p {where}", params)
+        total = cursor.fetchone()['total']
+
+        # 分页查询 - 使用 user_profiles 的 nickname 和 avatar_url
+        offset = (page - 1) * page_size
+
         cursor.execute(f"""
             SELECT p.id, p.user_id, p.content, p.images, p.video_url, p.flower_id, p.flower_name,
                    p.topics, p.mentions, p.likes_count, p.comments_count, p.favorites_count,
@@ -830,23 +837,23 @@ def get_posts():
 @bp.route('/posts', methods=['POST'])
 @token_required
 def create_post():
-    """发布帖子"""
+    """发布帖子 - 带AI内容审核"""
     from flask import g
     user_id = g.user_id
-    
+
     conn = get_db_connection()
     cursor = conn.cursor(DictCursor)
-    
+
     # 从 user_profiles 获取 nickname 和 avatar_url
     cursor.execute("SELECT nickname, avatar_url FROM user_profiles WHERE user_id = %s", (user_id,))
     profile = cursor.fetchone()
-    
+
     username = profile['nickname'] if profile and profile['nickname'] else g.user.get('username', '匿名用户')
     user_avatar = profile['avatar_url'] if profile and profile['avatar_url'] else g.user.get('avatar_url', '')
     cursor.close()
-    
+
     data = request.get_json()
-    
+
     content = data.get('content', '').strip()
     images = data.get('images', [])
     video_url = data.get('video_url')
@@ -854,38 +861,124 @@ def create_post():
     flower_name = data.get('flower_name')
     topics = data.get('topics', [])
     mentions = data.get('mentions', [])
-    
+
     if not content:
         conn.close()
         return jsonify({'success': False, 'error': '内容不能为空'}), 400
-    
+
+    # ========== AI内容审核 ==========
+    from utils.content_moderation import moderate_post
+
+    try:
+        moderation_result = moderate_post(content, images, video_url)
+        print(f"[INFO] AI审核结果: {moderation_result}")
+
+        # 根据审核结果确定帖子状态和审核信息
+        if moderation_result['suggestion'] == 'block':
+            # P0直接拒绝
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': '内容审核未通过，请修改后重试',
+                'audit': {
+                    'risk_level': moderation_result['risk_level'],
+                    'labels': moderation_result['labels'],
+                    'reason': '您的内容包含不当信息'
+                }
+            }), 400
+
+        elif moderation_result['suggestion'] == 'review':
+            # P1进入人工审核
+            post_status = 'pending'
+            audit_info = json.dumps({
+                'risk_level': moderation_result['risk_level'],
+                'labels': moderation_result['labels'],
+                'max_score': moderation_result['max_score'],
+                'audit_type': 'ai_pending',
+                'ai_review_time': datetime.now().isoformat()
+            }, ensure_ascii=False)
+        else:
+            # P2或无风险，直接通过
+            post_status = 'approved'
+            admin_status = 'auto_pass'  # AI自动通过，无需管理员处理
+            audit_info = json.dumps({
+                'risk_level': moderation_result['risk_level'],
+                'labels': moderation_result['labels'],
+                'max_score': moderation_result['max_score'],
+                'audit_type': 'ai_auto_pass',
+                'ai_review_time': datetime.now().isoformat()
+            }, ensure_ascii=False) if moderation_result['labels'] else None
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        # 审核异常时，保守起见进入人工审核
+        post_status = 'pending'
+        admin_status = None
+        audit_info = json.dumps({
+            'risk_level': 'P1',
+            'labels': ['audit_error'],
+            'error': str(e),
+            'audit_type': 'ai_error'
+        }, ensure_ascii=False)
+
     cursor = conn.cursor()
-    
+
+    # 如果是pending状态，admin_status保持为NULL（待处理）
+    if 'admin_status' not in dir():
+        admin_status = None
+
     try:
         cursor.execute("""
-            INSERT INTO posts 
-            (user_id, username, user_avatar, content, images, video_url, flower_id, flower_name, topics, mentions)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (user_id, username, user_avatar, content, 
+            INSERT INTO posts
+            (user_id, username, user_avatar, content, images, video_url, flower_id, flower_name, topics, mentions, status, admin_status, audit_info)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (user_id, username, user_avatar, content,
               json.dumps(images, ensure_ascii=False) if images else None,
               video_url, flower_id, flower_name,
               json.dumps(topics, ensure_ascii=False) if topics else None,
-              json.dumps(mentions, ensure_ascii=False) if mentions else None))
+              json.dumps(mentions, ensure_ascii=False) if mentions else None,
+              post_status, admin_status, audit_info))
         conn.commit()
-        
+
         post_id = cursor.lastrowid
-        
-        # 更新用户发帖数
-        cursor.execute("UPDATE user_profiles SET posts_count = posts_count + 1 WHERE user_id = %s", (user_id,))
-        conn.commit()
-        
-        # 添加经验值：发布内容+10
-        add_experience(user_id, 'post', '发布帖子')
-        
+
+        # 如果是AI审核进入pending状态，发送通知给用户
+        if post_status == 'pending':
+            try:
+                create_notification(
+                    user_id=user_id,
+                    actor_id='system',
+                    actor_name='系统',
+                    actor_avatar='',
+                    notification_type='system',
+                    target_type='post',
+                    target_id=post_id,
+                    target_content='您的帖子正在等待人工审核'
+                )
+            except Exception as notif_err:
+                print(f"[WARN] 发送审核通知失败: {notif_err}")
+
+        # 更新用户发帖数（只有审核通过的才增加）
+        if post_status == 'approved':
+            cursor.execute("UPDATE user_profiles SET posts_count = posts_count + 1 WHERE user_id = %s", (user_id,))
+            conn.commit()
+            # 添加经验值：发布内容+10
+            add_experience(user_id, 'post', '发布帖子')
+            message = '发布成功'
+        else:
+            message = '发布成功，内容正在审核中'
+
         return jsonify({
-            'success': True, 
-            'message': '发布成功',
-            'post_id': post_id
+            'success': True,
+            'message': message,
+            'post_id': post_id,
+            'status': post_status,
+            'need_manual_review': post_status == 'pending',
+            'audit': {
+                'risk_level': moderation_result.get('risk_level', 'none') if 'moderation_result' in dir() else 'none',
+                'suggestion': moderation_result.get('suggestion', 'pass') if 'moderation_result' in dir() else 'pass'
+            }
         })
     except Exception as e:
         conn.rollback()
@@ -902,40 +995,51 @@ def create_post():
 def get_audit_list():
     """获取审核列表"""
     from flask import g
-    
+
     # 检查管理员权限
     if not g.user.get('is_admin'):
         return jsonify({'success': False, 'error': '需要管理员权限'}), 403
-    
+
     page = int(request.args.get('page', 1))
     page_size = int(request.args.get('page_size', 10))
     status = request.args.get('status', 'pending')
-    
+    risk_level = request.args.get('risk_level')
+
     if status not in ['pending', 'approved', 'rejected']:
         status = 'pending'
-    
+
     conn = get_db_connection()
     cursor = conn.cursor(DictCursor)
-    
+
     try:
         offset = (page - 1) * page_size
-        
-        cursor.execute("""
-            SELECT COUNT(*) as total FROM posts WHERE status = %s
-        """, (status,))
+
+        # 构建查询条件
+        where_sql = "p.status = %s"
+        params = [status]
+
+        if risk_level:
+            where_sql += " AND JSON_EXTRACT(p.audit_info, '$.risk_level') = %s"
+            params.append(risk_level)
+
+        cursor.execute(f"""
+            SELECT COUNT(*) as total FROM posts p WHERE {where_sql}
+        """, params)
         total = cursor.fetchone()['total']
-        
-        cursor.execute("""
+
+        cursor.execute(f"""
             SELECT p.*, u.username as author_name
             FROM posts p
             LEFT JOIN users u ON p.user_id = u.id
-            WHERE p.status = %s
-            ORDER BY p.created_at DESC
+            WHERE {where_sql}
+            ORDER BY
+                CASE WHEN p.status = 'pending' THEN 0 ELSE 1 END,
+                p.created_at DESC
             LIMIT %s OFFSET %s
-        """, (status, page_size, offset))
-        
+        """, params + [page_size, offset])
+
         posts = cursor.fetchall()
-        
+
         for post in posts:
             if post['images']:
                 try:
@@ -947,7 +1051,12 @@ def get_audit_list():
                     post['topics'] = json.loads(post['topics'])
                 except:
                     post['topics'] = []
-        
+            if post.get('audit_info'):
+                try:
+                    post['audit_info'] = json.loads(post['audit_info'])
+                except:
+                    post['audit_info'] = {}
+
         return jsonify({
             'success': True,
             'data': {
@@ -973,25 +1082,149 @@ def get_pending_posts():
     return get_audit_list()
 
 
+@bp.route('/audit/processed', methods=['GET'])
+@token_required
+def get_processed_posts():
+    """获取已处理过的帖子（管理员查看）"""
+    from flask import g
+
+    if not g.user.get('is_admin'):
+        return jsonify({'success': False, 'error': '需要管理员权限'}), 403
+
+    page = int(request.args.get('page', 1))
+    page_size = int(request.args.get('page_size', 10))
+    admin_status = request.args.get('admin_status')  # approved/rejected/auto_pass
+
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+
+    try:
+        offset = (page - 1) * page_size
+
+        # 构建查询条件
+        where_clauses = ["p.admin_status IS NOT NULL"]
+        params = []
+
+        if admin_status:
+            where_clauses.append("p.admin_status = %s")
+            params.append(admin_status)
+
+        where_sql = " AND ".join(where_clauses)
+
+        # 查询总数
+        cursor.execute(f"SELECT COUNT(*) as total FROM posts p WHERE {where_sql}", params)
+        total = cursor.fetchone()['total']
+
+        # 查询列表
+        cursor.execute(f"""
+            SELECT p.*, u.username as author_name
+            FROM posts p
+            LEFT JOIN users u ON p.user_id = u.id
+            WHERE {where_sql}
+            ORDER BY p.updated_at DESC
+            LIMIT %s OFFSET %s
+        """, params + [page_size, offset])
+
+        posts = cursor.fetchall()
+
+        for post in posts:
+            if post['images']:
+                try:
+                    post['images'] = json.loads(post['images'])
+                except:
+                    post['images'] = []
+            if post.get('topics'):
+                try:
+                    post['topics'] = json.loads(post['topics'])
+                except:
+                    post['topics'] = []
+            if post.get('audit_info'):
+                try:
+                    post['audit_info'] = json.loads(post['audit_info'])
+                except:
+                    post['audit_info'] = {}
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'posts': posts,
+                'total': total,
+                'page': page,
+                'page_size': page_size,
+                'total_pages': (total + page_size - 1) // page_size if total > 0 else 0
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
 @bp.route('/audit/<int:post_id>/approve', methods=['POST'])
 @token_required
 def approve_post(post_id):
     """审核通过帖子"""
     from flask import g
-    
+    from datetime import datetime
+
     if not g.user.get('is_admin'):
         return jsonify({'success': False, 'error': '需要管理员权限'}), 403
-    
+
     conn = get_db_connection()
-    cursor = conn.cursor()
-    
+    cursor = conn.cursor(DictCursor)
+
     try:
-        cursor.execute("UPDATE posts SET status = 'approved' WHERE id = %s", (post_id,))
-        conn.commit()
-        
-        if cursor.rowcount == 0:
+        # 获取帖子信息
+        cursor.execute("""
+            SELECT p.*, u.username as author_name
+            FROM posts p
+            LEFT JOIN users u ON p.user_id = u.id
+            WHERE p.id = %s
+        """, (post_id,))
+        post = cursor.fetchone()
+
+        if not post:
             return jsonify({'success': False, 'error': '帖子不存在'}), 404
-        
+
+        if post['status'] == 'approved':
+            return jsonify({'success': False, 'error': '帖子已审核通过'}), 400
+
+        # 更新帖子状态
+        cursor.execute("""
+            UPDATE posts
+            SET status = 'approved',
+                admin_status = 'approved',
+                audit_info = JSON_SET(COALESCE(audit_info, '{}'),
+                    '$.manual_review_time', %s,
+                    '$.manual_reviewer_id', %s,
+                    '$.audit_type', 'manual_review')
+            WHERE id = %s
+        """, (datetime.now().isoformat(), g.user_id, post_id))
+        conn.commit()
+
+        # 更新用户发帖数
+        cursor.execute("UPDATE user_profiles SET posts_count = posts_count + 1 WHERE user_id = %s", (post['user_id'],))
+        conn.commit()
+
+        # 添加经验值
+        try:
+            add_experience(post['user_id'], 'post', '发布帖子')
+        except:
+            pass
+
+        # 发送审核通过通知
+        create_notification(
+            user_id=post['user_id'],
+            actor_id='system',
+            actor_name='系统',
+            actor_avatar='',
+            notification_type='system',
+            target_type='post',
+            target_id=post_id,
+            target_content='您的帖子已审核通过'
+        )
+
         return jsonify({'success': True, 'message': '审核通过'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1005,23 +1238,60 @@ def approve_post(post_id):
 def reject_post(post_id):
     """审核拒绝帖子"""
     from flask import g
-    
+    from datetime import datetime
+
     if not g.user.get('is_admin'):
         return jsonify({'success': False, 'error': '需要管理员权限'}), 403
-    
+
     data = request.get_json() or {}
     reason = data.get('reason', '')
-    
+
     conn = get_db_connection()
-    cursor = conn.cursor()
-    
+    cursor = conn.cursor(DictCursor)
+
     try:
-        cursor.execute("UPDATE posts SET status = 'rejected' WHERE id = %s", (post_id,))
-        conn.commit()
-        
-        if cursor.rowcount == 0:
+        # 获取帖子信息
+        cursor.execute("""
+            SELECT p.*, u.username as author_name
+            FROM posts p
+            LEFT JOIN users u ON p.user_id = u.id
+            WHERE p.id = %s
+        """, (post_id,))
+        post = cursor.fetchone()
+
+        if not post:
             return jsonify({'success': False, 'error': '帖子不存在'}), 404
-        
+
+        if post['status'] == 'rejected':
+            return jsonify({'success': False, 'error': '帖子已审核拒绝'}), 400
+
+        # 更新帖子状态
+        cursor.execute("""
+            UPDATE posts
+            SET status = 'rejected',
+                admin_status = 'rejected',
+                audit_info = JSON_SET(COALESCE(audit_info, '{}'),
+                    '$.manual_review_time', %s,
+                    '$.manual_reviewer_id', %s,
+                    '$.audit_type', 'manual_review',
+                    '$.reject_reason', %s)
+            WHERE id = %s
+        """, (datetime.now().isoformat(), g.user_id, reason, post_id))
+        conn.commit()
+
+        # 发送审核拒绝通知
+        notification_content = f'您的帖子未通过审核，原因：{reason}' if reason else '您的帖子未通过审核'
+        create_notification(
+            user_id=post['user_id'],
+            actor_id='system',
+            actor_name='系统',
+            actor_avatar='',
+            notification_type='system',
+            target_type='post',
+            target_id=post_id,
+            target_content=notification_content
+        )
+
         return jsonify({'success': True, 'message': '已拒绝'})
     except Exception as e:
         conn.rollback()

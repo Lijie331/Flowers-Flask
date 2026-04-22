@@ -88,3 +88,23 @@ def init_env():
 
 # 启动时自动初始化
 init_env()
+
+# ============== 阿里云内容审核配置 ==============
+ALIYUN_CONTENT_MODERATION = {
+    'access_key_id': 'LTAI5t9XhhSYYWHVHsHjV7RT',
+    'access_key_secret': 'i5jYF5DNlofWtPzkBB00YAmCcIqHsM',
+    'region': 'cn-shanghai',
+    'endpoint': 'green.cn-shanghai.aliyuncs.com',
+    'scenes': ['text', 'image', 'video'],
+    'thresholds': {
+        'P0': 60,
+        'P1': 50,
+        'P2': 30,
+    },
+    'P0_LABELS': ['politics', 'terror', 'minor', 'propaganda', 'extremism', 'cult'],
+    'P1_LABELS': ['porn', 'vulgar', 'gore', 'violence', 'advertising', 'junk'],
+    'P2_LABELS': ['minor_abuse', 'soft_ad'],
+}
+
+# 是否启用AI内容审核
+ENABLE_CONTENT_MODERATION = True
