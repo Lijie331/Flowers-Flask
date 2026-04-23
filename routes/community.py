@@ -1864,16 +1864,21 @@ def get_garden_photos(plant_id):
         
         # 获取照片记录
         cursor.execute("""
-            SELECT * FROM garden_photos 
-            WHERE garden_id = %s 
+            SELECT id, garden_id, user_id, image_url, notes, recorded_date, created_at
+            FROM garden_photos
+            WHERE garden_id = %s
             ORDER BY recorded_date DESC, created_at DESC
         """, (plant_id,))
         photos = cursor.fetchall()
-        
-        # 生成完整的图片URL
+
+        # 处理日期字段和图片URL
         base_url = request.host_url.rstrip('/')
         for photo in photos:
-            if photo['image_url'] and not photo['image_url'].startswith('http'):
+            if photo.get('recorded_date'):
+                photo['recorded_date'] = str(photo['recorded_date'])
+            if photo.get('created_at'):
+                photo['created_at'] = photo['created_at'].isoformat()
+            if photo.get('image_url') and not photo['image_url'].startswith('http'):
                 photo['image_url'] = base_url + photo['image_url']
         
         return jsonify({
@@ -2005,15 +2010,23 @@ def get_diary_entries(plant_id):
         
         # 获取日志记录
         cursor.execute("""
-            SELECT * FROM garden_diary_entries 
-            WHERE garden_id = %s 
+            SELECT id, garden_id, user_id, diary_date, content, mood, weather, image_url, created_at, updated_at
+            FROM garden_diary_entries
+            WHERE garden_id = %s
             ORDER BY diary_date DESC, created_at DESC
         """, (plant_id,))
         entries = cursor.fetchall()
-        
-        # 生成完整的图片URL
+
+        # 处理日期字段和图片URL
         base_url = request.host_url.rstrip('/')
         for entry in entries:
+            # 转换 diary_date 为字符串
+            if entry.get('diary_date'):
+                entry['diary_date'] = str(entry['diary_date'])
+            if entry.get('created_at'):
+                entry['created_at'] = entry['created_at'].isoformat()
+            if entry.get('updated_at'):
+                entry['updated_at'] = entry['updated_at'].isoformat()
             if entry.get('image_url') and not entry['image_url'].startswith('http'):
                 entry['image_url'] = base_url + entry['image_url']
         
@@ -2168,19 +2181,62 @@ def get_care_schedules(plant_id):
     
     conn = get_db_connection()
     cursor = conn.cursor(DictCursor)
-    
+
     try:
+        # 确保表存在
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS garden_care_schedules (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                garden_id INT NOT NULL,
+                user_id VARCHAR(8) NOT NULL,
+                care_type VARCHAR(20) NOT NULL DEFAULT 'water',
+                frequency_days INT NOT NULL DEFAULT 7,
+                next_due DATE,
+                last_done DATE,
+                notes TEXT,
+                is_active TINYINT(1) DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_garden_id (garden_id),
+                INDEX idx_user_id (user_id),
+                INDEX idx_next_due (next_due)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS garden_care_logs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                schedule_id INT NOT NULL,
+                garden_id INT NOT NULL,
+                user_id VARCHAR(8) NOT NULL,
+                care_type VARCHAR(20) NOT NULL,
+                care_date DATE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_schedule_id (schedule_id),
+                INDEX idx_garden_id (garden_id)
+            )
+        """)
+        conn.commit()
+
         cursor.execute("SELECT * FROM user_garden WHERE id = %s AND user_id = %s", (plant_id, user_id))
         if not cursor.fetchone():
             return jsonify({'success': False, 'error': '植物不存在'}), 404
-        
+
         cursor.execute("""
-            SELECT * FROM garden_care_schedules 
+            SELECT id, garden_id, user_id, care_type, frequency_days, next_due, last_done, notes, is_active, created_at
+            FROM garden_care_schedules
             WHERE garden_id = %s AND is_active = 1
             ORDER BY next_due ASC
         """, (plant_id,))
         schedules = cursor.fetchall()
-        
+
+        # 转换日期字段为字符串
+        for schedule in schedules:
+            if schedule.get('next_due'):
+                schedule['next_due'] = str(schedule['next_due'])
+            if schedule.get('last_done'):
+                schedule['last_done'] = str(schedule['last_done'])
+            if schedule.get('created_at'):
+                schedule['created_at'] = schedule['created_at'].isoformat()
+
         return jsonify({
             'success': True,
             'data': {'schedules': schedules}
