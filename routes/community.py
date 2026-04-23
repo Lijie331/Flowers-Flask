@@ -1386,6 +1386,7 @@ def block_post(post_id):
         cursor.execute("""
             UPDATE posts
             SET status = 'rejected',
+                admin_status = 'rejected',
                 audit_info = JSON_SET(COALESCE(audit_info, '{}'),
                     '$.manual_review_time', %s,
                     '$.manual_reviewer_id', %s,
@@ -1438,12 +1439,14 @@ def allow_post(post_id):
         if not post:
             return jsonify({'success': False, 'error': '帖子不存在'}), 404
 
-        if post['status'] == 'approved':
-            return jsonify({'success': False, 'error': '帖子已是允许状态'}), 400
+        if post['status'] != 'rejected':
+            return jsonify({'success': False, 'error': '只能恢复已拒绝的帖子'}), 400
 
         cursor.execute("""
             UPDATE posts
             SET status = 'approved',
+                admin_status = 'auto_pass',
+                is_auto_passed = 1,
                 audit_info = JSON_SET(COALESCE(audit_info, '{}'),
                     '$.manual_review_time', %s,
                     '$.manual_reviewer_id', %s,
@@ -1463,7 +1466,7 @@ def allow_post(post_id):
             target_content='您的帖子已恢复在社区展示'
         )
 
-        return jsonify({'success': True, 'message': '已允许'})
+        return jsonify({'success': True, 'message': '已恢复'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
