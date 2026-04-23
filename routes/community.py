@@ -877,6 +877,8 @@ def create_post():
         if moderation_result['suggestion'] == 'block':
             # P0文本/图片违规，进入人工审核
             post_status = 'pending'
+            is_auto_passed = 0
+            risk_level = 'P0'
             # 区分文本和图片的标签
             text_labels = moderation_result.get('details', {}).get('text', {}).get('labels', [])
             image_labels = []
@@ -898,6 +900,8 @@ def create_post():
         elif moderation_result['suggestion'] == 'review':
             # P1进入人工审核
             post_status = 'pending'
+            is_auto_passed = 0
+            risk_level = 'P1'
             text_labels = moderation_result.get('details', {}).get('text', {}).get('labels', [])
             image_labels = []
             for img_result in moderation_result.get('details', {}).get('images', []):
@@ -918,6 +922,8 @@ def create_post():
             # P2或无风险，直接通过
             post_status = 'approved'
             admin_status = 'auto_pass'  # AI自动通过，无需管理员处理
+            is_auto_passed = 1
+            risk_level = moderation_result.get('risk_level', 'none')
             audit_info = json.dumps({
                 'risk_level': moderation_result['risk_level'],
                 'labels': moderation_result['labels'],
@@ -932,6 +938,7 @@ def create_post():
         # 审核异常时，保守起见进入人工审核
         post_status = 'pending'
         admin_status = None
+        risk_level = 'P1'
         audit_info = json.dumps({
             'risk_level': 'P1',
             'labels': ['audit_error'],
@@ -944,18 +951,24 @@ def create_post():
     # 如果是pending状态，admin_status保持为NULL（待处理）
     if 'admin_status' not in dir():
         admin_status = None
+    # 默认 is_auto_passed = 0
+    if 'is_auto_passed' not in dir():
+        is_auto_passed = 0
+    # 默认 risk_level
+    if 'risk_level' not in dir():
+        risk_level = None
 
     try:
         cursor.execute("""
             INSERT INTO posts
-            (user_id, username, user_avatar, content, images, video_url, flower_id, flower_name, topics, mentions, status, admin_status, audit_info)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (user_id, username, user_avatar, content, images, video_url, flower_id, flower_name, topics, mentions, status, admin_status, audit_info, is_auto_passed, risk_level)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (user_id, username, user_avatar, content,
               json.dumps(images, ensure_ascii=False) if images else None,
               video_url, flower_id, flower_name,
               json.dumps(topics, ensure_ascii=False) if topics else None,
               json.dumps(mentions, ensure_ascii=False) if mentions else None,
-              post_status, admin_status, audit_info))
+              post_status, admin_status, audit_info, is_auto_passed, risk_level))
         conn.commit()
 
         post_id = cursor.lastrowid
@@ -1143,7 +1156,10 @@ def get_processed_posts():
         where_clauses = ["p.admin_status IS NOT NULL"]
         params = []
 
-        if admin_status:
+        if admin_status == 'auto_pass':
+            # AI自动通过的帖子用 is_auto_passed 字段判断
+            where_clauses.append("p.is_auto_passed = 1")
+        elif admin_status:
             where_clauses.append("p.admin_status = %s")
             params.append(admin_status)
 
@@ -1333,6 +1349,122 @@ def reject_post(post_id):
         return jsonify({'success': True, 'message': '已拒绝'})
     except Exception as e:
         conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/audit/<int:post_id>/block', methods=['POST'])
+@token_required
+def block_post(post_id):
+    """禁止帖子"""
+    from flask import g
+    from datetime import datetime
+
+    if not g.user.get('is_admin'):
+        return jsonify({'success': False, 'error': '需要管理员权限'}), 403
+
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+
+    try:
+        cursor.execute("""
+            SELECT p.*, u.username as author_name
+            FROM posts p
+            LEFT JOIN users u ON p.user_id = u.id
+            WHERE p.id = %s
+        """, (post_id,))
+        post = cursor.fetchone()
+
+        if not post:
+            return jsonify({'success': False, 'error': '帖子不存在'}), 404
+
+        if post['status'] == 'rejected':
+            return jsonify({'success': False, 'error': '帖子已被禁止'}), 400
+
+        cursor.execute("""
+            UPDATE posts
+            SET status = 'rejected',
+                audit_info = JSON_SET(COALESCE(audit_info, '{}'),
+                    '$.manual_review_time', %s,
+                    '$.manual_reviewer_id', %s,
+                    '$.audit_type', 'admin_block')
+            WHERE id = %s
+        """, (datetime.now().isoformat(), g.user_id, post_id))
+        conn.commit()
+
+        create_notification(
+            user_id=post['user_id'],
+            actor_id='system',
+            actor_name='系统',
+            actor_avatar='',
+            notification_type='system',
+            target_type='post',
+            target_id=post_id,
+            target_content='您的帖子已被管理员禁止发布'
+        )
+
+        return jsonify({'success': True, 'message': '已禁止'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bp.route('/audit/<int:post_id>/allow', methods=['POST'])
+@token_required
+def allow_post(post_id):
+    """允许被禁止的帖子"""
+    from flask import g
+    from datetime import datetime
+
+    if not g.user.get('is_admin'):
+        return jsonify({'success': False, 'error': '需要管理员权限'}), 403
+
+    conn = get_db_connection()
+    cursor = conn.cursor(DictCursor)
+
+    try:
+        cursor.execute("""
+            SELECT p.*, u.username as author_name
+            FROM posts p
+            LEFT JOIN users u ON p.user_id = u.id
+            WHERE p.id = %s
+        """, (post_id,))
+        post = cursor.fetchone()
+
+        if not post:
+            return jsonify({'success': False, 'error': '帖子不存在'}), 404
+
+        if post['status'] == 'approved':
+            return jsonify({'success': False, 'error': '帖子已是允许状态'}), 400
+
+        cursor.execute("""
+            UPDATE posts
+            SET status = 'approved',
+                audit_info = JSON_SET(COALESCE(audit_info, '{}'),
+                    '$.manual_review_time', %s,
+                    '$.manual_reviewer_id', %s,
+                    '$.audit_type', 'admin_allow')
+            WHERE id = %s
+        """, (datetime.now().isoformat(), g.user_id, post_id))
+        conn.commit()
+
+        create_notification(
+            user_id=post['user_id'],
+            actor_id='system',
+            actor_name='系统',
+            actor_avatar='',
+            notification_type='system',
+            target_type='post',
+            target_id=post_id,
+            target_content='您的帖子已恢复在社区展示'
+        )
+
+        return jsonify({'success': True, 'message': '已允许'})
+    except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
         cursor.close()

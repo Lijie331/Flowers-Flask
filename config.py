@@ -114,6 +114,7 @@ ALIYUN_CONTENT_MODERATION = {
         # 英文标签（文本审核）
         'porn', 'vulgar', 'violence', 'advertising', 'junk', 'fraud',
         'hate_speech', 'personal_attack', 'security_ threat', '钓鱼',
+        'inappropriate',
         # 中文标签（图片审核）
         '色情低俗', '辱骂谩骂人身攻击', '垃圾广告_营销导流', '违禁物品_违法交易',
         '诈骗_赌博_洗钱诱导', '仇恨言论_歧视', '隐私信息泄露', '恶意网址_木马引流'
@@ -138,6 +139,7 @@ ALIYUN_CONTENT_MODERATION = {
         'fraud': '欺诈诈骗',
         'hate_speech': '仇恨言论',
         'personal_attack': '人身攻击',
+        'inappropriate': '调性异常',
         'security_threat': '安全威胁',
         '钓鱼': '钓鱼诈骗',
         'minor_abuse': '未成年人违规',

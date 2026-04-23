@@ -201,12 +201,25 @@ class ContentModerationClient:
             if not oss_url:
                 return {'pass': True, 'risk_level': 'none', 'labels': [], 'score': 0, 'suggestion': 'pass'}
 
+            # 解析OSS URL获取bucket和objectKey
+            # URL格式: https://flowers-buck.oss-cn-beijing.aliyuncs.com/moderation/xxx.jpg
+            try:
+                # 去掉 https://
+                url_without_https = oss_url.replace('https://', '')
+                # 按 .aliyuncs.com/ 分割
+                parts = url_without_https.split('.aliyuncs.com/')
+                # bucket 格式是 xxx.oss-cn-beijing，取第一部分去掉 .oss-cn-beijing
+                bucket_with_region = parts[0]
+                oss_bucket_name = bucket_with_region.split('.oss-')[0] if '.oss-' in bucket_with_region else bucket_with_region
+                oss_object_key = parts[1]
+            except Exception as e:
+                print(f"[ERROR] 解析OSS URL失败: {e}")
+                return {'pass': True, 'risk_level': 'none', 'labels': [], 'score': 0, 'suggestion': 'pass'}
+
             # 构建智能体审核请求
-            # content 不能为空，传入占位文本
-            image_content = content if content and len(content) >= 1 else '图片内容审核'
             service_params = {
-                'content': image_content,
-                'images': [{'imageUrl': oss_url}],
+                'content': content or '图片内容审核',
+                'imageUrl': oss_url,
                 'DataId': str(uuid.uuid4())
             }
 
@@ -215,7 +228,7 @@ class ContentModerationClient:
                 service_parameters=json.dumps(service_params)
             )
 
-            print(f"[DEBUG] 发送图片审核请求: {oss_url}")
+            print(f"[DEBUG] 发送图片审核请求: bucket={oss_bucket_name}, key={oss_object_key}")
             response = self.clt.image_moderation(request)
 
             if response.status_code == 200:
