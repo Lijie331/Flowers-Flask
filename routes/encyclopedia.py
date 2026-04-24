@@ -230,6 +230,61 @@ morphology, habitat, growth_habit, ornamental_value,
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@bp.route('/search/by-name', methods=['GET'])
+def search_flower_by_name():
+    """根据花卉名称（中文或英文）搜索百科，返回匹配的百科记录"""
+    try:
+        name = request.args.get('name', '').strip()
+        if not name:
+            return jsonify({'success': False, 'error': '缺少花卉名称'}), 400
+
+        conn = get_db_connection()
+        if conn is None:
+            return jsonify({'success': False, 'error': '数据库连接失败'}), 500
+
+        cursor = conn.cursor()
+        # 支持中文名和拉丁名精确匹配（拉丁名使用LOWER()实现大小写不敏感）
+        cursor.execute("""
+            SELECT id, chinese_name, latin_name, family, genus, image_url
+            FROM flowers
+            WHERE chinese_name = %s OR LOWER(latin_name) = LOWER(%s)
+            LIMIT 1
+        """, (name, name))
+
+        row = cursor.fetchone()
+        if row:
+            columns = [desc[0] for desc in cursor.description]
+            flower = dict(zip(columns, row))
+            flower = process_image_data(flower)
+            cursor.close()
+            conn.close()
+            return jsonify({'success': True, 'data': flower})
+        else:
+            # 模糊匹配：中文名模糊匹配 或 拉丁名模糊匹配（大小写不敏感）
+            cursor.execute("""
+                SELECT id, chinese_name, latin_name, family, genus, image_url
+                FROM flowers
+                WHERE chinese_name LIKE %s OR LOWER(latin_name) LIKE LOWER(%s)
+                LIMIT 5
+            """, (f'%{name}%', f'%{name}%'))
+            rows = cursor.fetchall()
+            if rows:
+                columns = [desc[0] for desc in cursor.description]
+                flowers = [dict(zip(columns, row)) for row in rows]
+                flowers = [process_image_data(f) for f in flowers]
+                cursor.close()
+                conn.close()
+                return jsonify({'success': True, 'data': flowers, 'multiple': True})
+            cursor.close()
+            conn.close()
+            return jsonify({'success': False, 'error': '未找到匹配的花卉'}), 404
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @bp.route('/categories', methods=['GET'])
 def get_categories():
     """获取分类"""

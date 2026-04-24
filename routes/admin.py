@@ -31,9 +31,18 @@ def admin_required(f):
 @token_required
 @admin_required
 def get_users():
+    keyword = request.args.get('keyword', '').strip()
     conn = pymysql.connect(**DB_CONFIG)
     cursor = conn.cursor(pymysql.cursors.DictCursor)
-    cursor.execute("SELECT id, username, phone, is_admin, is_active, created_at FROM users ORDER BY id DESC")
+
+    if keyword:
+        # 模糊查找：支持ID和用户名模糊匹配
+        where_clause = "WHERE id LIKE %s OR username LIKE %s"
+        params = [f'%{keyword}%', f'%{keyword}%']
+        cursor.execute(f"SELECT id, username, phone, is_admin, is_active, created_at FROM users {where_clause} ORDER BY id DESC", params)
+    else:
+        cursor.execute("SELECT id, username, phone, is_admin, is_active, created_at FROM users ORDER BY id DESC")
+
     users = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -76,27 +85,28 @@ def get_history_admin():
     page_size = int(request.args.get('page_size', 10))
     user_id = request.args.get('user_id', '')
     offset = (page - 1) * page_size
-    
+
     conn = pymysql.connect(**DB_CONFIG)
     cursor = conn.cursor(pymysql.cursors.DictCursor)
-    
+
     where_clause = ""
     params = []
     if user_id:
-        where_clause = "WHERE user_id = %s"
-        params.append(user_id)
-    
+        # 支持模糊搜索用户ID
+        where_clause = "WHERE user_id LIKE %s"
+        params.append(f'%{user_id}%')
+
     count_sql = f"SELECT COUNT(*) as total FROM identify_history {where_clause}"
     cursor.execute(count_sql, params)
     total = cursor.fetchone()['total']
-    
+
     data_sql = f"""
         SELECT id, user_id, model_name, predicted_class_name, predicted_class_en, confidence, created_at
         FROM identify_history {where_clause} ORDER BY id DESC LIMIT %s OFFSET %s
     """
     cursor.execute(data_sql, params + [page_size, offset])
     history = cursor.fetchall()
-    
+
     cursor.close()
     conn.close()
     return jsonify({'success': True, 'history': history, 'total': total})

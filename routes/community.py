@@ -918,6 +918,7 @@ def create_post():
                 'audit_type': 'ai_pending',
                 'ai_review_time': datetime.now().isoformat()
             }, ensure_ascii=False)
+
         else:
             # P2或无风险，直接通过
             post_status = 'approved'
@@ -994,6 +995,7 @@ def create_post():
             try:
                 cursor.execute("SELECT id FROM users WHERE is_admin = 1")
                 admins = cursor.fetchall()
+                notify_content = f'您有帖子需要审核（ID: {post_id}）'
                 for admin in admins:
                     create_notification(
                         user_id=admin['id'],
@@ -1003,7 +1005,7 @@ def create_post():
                         notification_type='system',
                         target_type='post',
                         target_id=post_id,
-                        target_content=f'有新的帖子待审核（ID: {post_id}）'
+                        target_content=notify_content
                     )
                 if admins:
                     print(f"[INFO] 已通知 {len(admins)} 位管理员有新帖子待审核")

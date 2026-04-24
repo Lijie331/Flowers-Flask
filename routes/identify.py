@@ -14,7 +14,10 @@ import torch.nn.functional as F
 import pymysql
 from pymysql.cursors import DictCursor
 
-from config import CHECKPOINT_PATH, MODEL_CONFIG, IMAGE_MEAN, IMAGE_STD, IMAGE_BASE_URL, DB_CONFIG
+from config import CHECKPOINT_PATH, MODEL_CONFIG, IMAGE_MEAN, IMAGE_STD, IMAGE_BASE_URL, DB_CONFIG, PROJECT_ROOT
+
+# 历史图片存储路径
+IDENTIFY_HISTORY_DIR = os.path.join(PROJECT_ROOT, 'static', 'identify_history')
 
 
 # ============== 多模型配置 ==============
@@ -628,36 +631,31 @@ def classify_flower():
         if g.user_id and results and len(results) > 0:
             try:
                 top_result = results[0]
-                
+
                 # 准备top_results JSON数据
                 top_results_json = json.dumps(results[:5], ensure_ascii=False)
-                
-                # 保存到数据库（置信度存为0-1的小数，图片存为base64）
-                print(f"[DEBUG] 开始保存历史记录...")
-                print(f"[DEBUG] user_id: {g.user_id}")
-                print(f"[DEBUG] image_data长度: {len(image_data) if image_data else 0}")
-                
+
+                # 保存图片到磁盘
+                import uuid
+                from datetime import datetime
+                timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+                filename = f"single_{timestamp}_{uuid.uuid4().hex[:8]}.jpg"
+                os.makedirs(IDENTIFY_HISTORY_DIR, exist_ok=True)
+                filepath = os.path.join(IDENTIFY_HISTORY_DIR, filename)
+                image.save(filepath, 'JPEG', quality=85)
+                image_url = f'/static/identify_history/{filename}'
+
                 conn = pymysql.connect(**DB_CONFIG)
                 cursor = conn.cursor()
-                sql = """
 
-                INSERT INTO identify_history 
-                (user_id, image_url, model_name, predicted_class_id, predicted_class_name, 
-                 predicted_class_en, confidence, top_results)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """
-
-                
                 cursor.execute("""
-                    SELECT COUNT(*) as count 
-                    FROM identify_history 
+                    SELECT COUNT(*) as count
+                    FROM identify_history
                     WHERE user_id = %s
                 """, (g.user_id,))
                 count = cursor.fetchone()[0]
 
-                # 2️⃣ 如果 >=20，删除最早的一条
                 if count >= 20:
-                    print("[DEBUG] 超过20条，删除最早记录")
                     cursor.execute("""
                         DELETE FROM identify_history
                         WHERE id = (
@@ -669,15 +667,20 @@ def classify_flower():
                             ) as tmp
                         )
                     """, (g.user_id,))
-                cursor.execute(sql, (
-                    g.user_id,  # 用户ID
-                    image_data[:30000] if len(image_data) > 30000 else image_data,  # 图片base64（限制30KB）
-                    current_model_name,  # 模型名称
-                    top_result['class_id'],  # 预测类别ID
-                    top_result['name_cn'],  # 中文名
-                    top_result['name_en'],  # 英文名
-                    top_result['confidence'] / 100.0,  # 置信度转为0-1
-                    top_results_json  # JSON格式的top结果
+                cursor.execute("""
+                    INSERT INTO identify_history
+                    (user_id, image_url, model_name, predicted_class_id, predicted_class_name,
+                     predicted_class_en, confidence, top_results)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    g.user_id,
+                    image_url,
+                    current_model_name,
+                    top_result['class_id'],
+                    top_result['name_cn'],
+                    top_result['name_en'],
+                    top_result['confidence'] / 100.0,
+                    top_results_json
                 ))
                 conn.commit()
                 cursor.close()
@@ -724,6 +727,206 @@ def get_classes():
     })
 
 
+@bp.route('/classify/batch', methods=['POST'])
+@optional_token_required
+def classify_flower_batch():
+    """批量花卉识别接口 - 一次处理多张图片，保存为一条历史记录"""
+    global model, device, current_model_name
+
+    from flask import g
+    import torch
+
+    data = request.get_json()
+    if not data or 'images' not in data:
+        return jsonify({'success': False, 'error': 'Missing images data'}), 400
+
+    images_base64 = data.get('images', [])
+    if len(images_base64) < 2:
+        return jsonify({'success': False, 'error': 'Batch requires at least 2 images'}), 400
+
+    top_k = data.get('top_k', 5)
+    requested_model = data.get('model')
+
+    # 模型切换逻辑（同单图接口）
+    if requested_model and requested_model != current_model_name:
+        if requested_model in MODEL_REGISTRY:
+            conn_temp = pymysql.connect(**DB_CONFIG)
+            cursor_temp = conn_temp.cursor()
+            cursor_temp.execute("SELECT enabled FROM model_status WHERE model_id = %s", (requested_model,))
+            result = cursor_temp.fetchone()
+            cursor_temp.close()
+            conn_temp.close()
+            if result and result[0] == 0:
+                return jsonify({'success': False, 'error': f'模型 {MODEL_REGISTRY[requested_model]["display_name"]} 已被禁用'}), 400
+            if not load_model(requested_model):
+                return jsonify({'success': False, 'error': f'Failed to load model: {requested_model}'}), 500
+
+    if model is None:
+        if not load_model():
+            return jsonify({'success': False, 'error': 'Model failed to load'}), 500
+
+    trans = get_transform()
+
+    # 确保目录存在
+    os.makedirs(IDENTIFY_HISTORY_DIR, exist_ok=True)
+
+    try:
+        # 遍历识别每张图片
+        all_image_results = []
+        for idx, image_b64 in enumerate(images_base64):
+            try:
+                image_bytes = base64.b64decode(image_b64)
+                image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+                img_tensor = trans(image).unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    output = model(img_tensor)
+                    probs = torch.softmax(output, dim=1)
+                    top_probs, top_indices = torch.topk(probs, min(top_k, len(CLASSNAMES)), dim=1)
+
+                results = []
+                for prob, idx_cls in zip(top_probs[0], top_indices[0]):
+                    class_id = int(idx_cls.item())
+                    if class_id in CLASS_MAPPING:
+                        mapping = CLASS_MAPPING[class_id]
+                        english_name = mapping['en']
+                        chinese_name = mapping['zh']
+                    else:
+                        english_name = f"class_{class_id}"
+                        chinese_name = f"类别_{class_id}"
+
+                    results.append({
+                        'class_id': class_id,
+                        'class_id_1based': class_id + 1,
+                        'name_en': english_name,
+                        'name_cn': chinese_name,
+                        'display_name': f"{chinese_name} ({english_name})",
+                        'confidence': round(prob.item() * 100, 2)
+                    })
+
+                # 保存图片到磁盘
+                import uuid
+                from datetime import datetime
+                timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+                filename = f"{timestamp}_{uuid.uuid4().hex[:8]}.jpg"
+                filepath = os.path.join(IDENTIFY_HISTORY_DIR, filename)
+                image.save(filepath, 'JPEG', quality=85)
+                img_url = f'/static/identify_history/{filename}'
+
+                all_image_results.append({
+                    'image_index': idx,
+                    'image_url': img_url,
+                    'top_results': results,
+                    'top_result': results[0] if results else None
+                })
+            except Exception as e:
+                print(f"[ERROR] 第 {idx} 张图片处理失败: {e}")
+                all_image_results.append({
+                    'image_index': idx,
+                    'image_url': '',
+                    'top_results': [],
+                    'top_result': None,
+                    'error': str(e)
+                })
+
+        # 合并结果：按花卉名称分组，计算平均置信度
+        merged_map = {}
+        for img_result in all_image_results:
+            if not img_result['top_result']:
+                continue
+            top = img_result['top_result']
+            key = top['name_cn']
+            if key not in merged_map:
+                merged_map[key] = {
+                    'class_id': top['class_id'],
+                    'name_cn': top['name_cn'],
+                    'name_en': top['name_en'],
+                    'confidences': [],
+                    'count': 0
+                }
+            merged_map[key]['confidences'].append(top['confidence'])
+            merged_map[key]['count'] += 1
+
+        for key in merged_map:
+            confidences = merged_map[key]['confidences']
+            merged_map[key]['avgConfidence'] = sum(confidences) / len(confidences) if confidences else 0
+
+        batch_summary = sorted(merged_map.values(), key=lambda x: x['avgConfidence'], reverse=True)[:5]
+        for item in batch_summary:
+            item['avgConfidence'] = round(item['avgConfidence'], 2)
+            del item['confidences']
+
+        # 添加经验值（只加一次）
+        if g.user_id:
+            try:
+                from routes.user import add_experience
+                add_experience(g.user_id, 'identify', '批量识别花卉')
+            except:
+                pass
+
+        # 保存历史记录（只存一条）
+        if g.user_id and all_image_results:
+            try:
+                conn = pymysql.connect(**DB_CONFIG)
+                cursor = conn.cursor()
+
+                # 检查记录数量
+                cursor.execute("SELECT COUNT(*) FROM identify_history WHERE user_id = %s", (g.user_id,))
+                count = cursor.fetchone()[0]
+                if count >= 20:
+                    cursor.execute("""
+                        DELETE FROM identify_history
+                        WHERE id = (SELECT id FROM (SELECT id FROM identify_history WHERE user_id = %s ORDER BY created_at ASC LIMIT 1) AS t)
+                    """, (g.user_id,))
+
+                # top_results 存所有图片的完整结果
+                top_results_full = json.dumps({
+                    'batch': True,
+                    'image_count': len(images_base64),
+                    'summary': batch_summary,
+                    'images': all_image_results
+                }, ensure_ascii=False)
+
+                # 用第一张图片的结果作为主显示
+                first_result = all_image_results[0]['top_result'] if all_image_results and all_image_results[0]['top_result'] else None
+
+                cursor.execute("""
+                    INSERT INTO identify_history
+                    (user_id, image_url, model_name, predicted_class_id, predicted_class_name,
+                     predicted_class_en, confidence, top_results)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    g.user_id,
+                    all_image_results[0]['image_url'] if all_image_results else '',
+                    current_model_name,
+                    first_result['class_id'] if first_result else 0,
+                    first_result['name_cn'] if first_result else '',
+                    first_result['name_en'] if first_result else '',
+                    (first_result['confidence'] / 100.0) if first_result else 0,
+                    top_results_full
+                ))
+                conn.commit()
+                cursor.close()
+                conn.close()
+                print(f"[INFO] 批量识别历史已保存: {len(images_base64)} 张图片")
+            except Exception as e:
+                import traceback
+                print(f"[ERROR] 保存批量识别历史失败: {e}")
+                print(traceback.format_exc())
+
+        return jsonify({
+            'success': True,
+            'results': batch_summary,
+            'all_image_results': all_image_results,
+            'image_count': len(images_base64)
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @bp.route('/identify/history', methods=['GET'])
 @optional_token_required
 def get_identify_history():
@@ -763,14 +966,17 @@ def get_identify_history():
         """, (user_id,))
         total = cursor.fetchone()['total']
 
-        # ✅ 2. 分页查询
+        # ✅ 2. 分页查询（先排序ID再取完整字段，避免大字段top_results参与排序导致内存溢出）
         cursor.execute("""
-            SELECT id, model_name, predicted_class_id, predicted_class_name, 
-                   predicted_class_en, confidence, top_results, image_url, created_at
-            FROM identify_history
-            WHERE user_id = %s
-            ORDER BY created_at DESC
-            LIMIT %s OFFSET %s
+            SELECT h.id, h.model_name, h.predicted_class_id, h.predicted_class_name,
+                   h.predicted_class_en, h.confidence, h.top_results, h.image_url, h.created_at
+            FROM (
+                SELECT id FROM identify_history
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+            ) AS sorted
+            JOIN identify_history AS h ON sorted.id = h.id
         """, (user_id, page_size, offset))
 
         records = cursor.fetchall()
